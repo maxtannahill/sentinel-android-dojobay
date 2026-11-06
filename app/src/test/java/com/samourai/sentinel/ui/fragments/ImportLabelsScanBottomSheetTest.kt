@@ -209,9 +209,13 @@ class ImportLabelsScanBottomSheetTest {
         assertTrue(session.receive(frames[2]) is BbqrReceive.Pending)
         assertTrue(session.receive(frames[0]) is BbqrReceive.Pending)
         assertTrue(session.receive(frames[0]) is BbqrReceive.Pending)
-        // A header that cannot address a part does not wipe the parts
-        // already stored for this series.
-        assertTrue(session.receive("B\$HU0305FFFF") is BbqrReceive.Rejected)
+        // An index past the header count is skipped. It does not toast
+        // and it does not wipe the parts already stored.
+        assertEquals(
+            BbqrReceive.Pending(BbqrProgress(2, 3), storedNewPart = false),
+            session.receive("B\$HU0305FFFF")
+        )
+        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$HU0305FFFF", session))
         val done = session.receive(frames[1])
         assertTrue(done is BbqrReceive.Complete)
         assertArrayEquals(raw, (done as BbqrReceive.Complete).bytes)
@@ -287,15 +291,71 @@ class ImportLabelsScanBottomSheetTest {
     }
 
     @Test
-    fun conflictingRepeatFailsTheSeries() {
+    fun conflictingRepeatKeepsTheFirstBody() {
         val session = BbqrAccumulator()
-        assertTrue(session.receive("B\$HU02000001") is BbqrReceive.Pending)
-        val conflict = session.receive("B\$HU020000FF")
         assertEquals(
-            BbqrReceive.Rejected(BbqrFailure.Decode),
-            conflict
+            BbqrReceive.Pending(BbqrProgress(1, 2), storedNewPart = true),
+            session.receive("B\$HU02000001")
         )
-        assertTrue(session.receive("B\$HU0201FFFF") is BbqrReceive.Pending)
+        assertEquals(
+            BbqrReceive.Pending(BbqrProgress(1, 2), storedNewPart = false),
+            session.receive("B\$HU020000FF")
+        )
+        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$HU020000FF", session))
+        assertEquals(BbqrProgress(1, 2), session.progress())
+        val done = session.receive("B\$HU0201FFFF")
+        assertTrue(done is BbqrReceive.Complete)
+        assertArrayEquals(
+            byteArrayOf(0x00, 0x01, 0xff.toByte(), 0xff.toByte()),
+            (done as BbqrReceive.Complete).bytes
+        )
+        assertEquals(
+            BbqrReceive.Pending(BbqrProgress(2, 2), storedNewPart = false),
+            session.receive("B\$HU0201FFFF")
+        )
+    }
+
+    @Test
+    fun garbledFrameIsSkippedAndALaterPartCanComplete() {
+        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$HU02000G"))
+        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$HU0305FFFF"))
+
+        val jsonl = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"hi\"}"
+        val frames = encodeBbqr(
+            jsonl.toByteArray(StandardCharsets.UTF_8),
+            'H',
+            parts = 2
+        )
+        assertEquals(2, frames.size)
+        val session = BbqrAccumulator()
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 2)),
+            scan(frames[0], session)
+        )
+
+        val badNewPart = frames[1].take(BBQR_HEADER_LENGTH) + "0G"
+        assertEquals(LabelScanAction.IgnoreAndResume, scan(badNewPart, session))
+        assertEquals(BbqrProgress(1, 2), session.progress())
+
+        val unaddressable = frames[0].take(6) + "05FFFF"
+        assertEquals(LabelScanAction.IgnoreAndResume, scan(unaddressable, session))
+        assertEquals(BbqrProgress(1, 2), session.progress())
+
+        val conflict = frames[0].take(BBQR_HEADER_LENGTH) + "00"
+        assertFalse(conflict == frames[0])
+        assertEquals(LabelScanAction.IgnoreAndResume, scan(conflict, session))
+        assertEquals(BbqrProgress(1, 2), session.progress())
+
+        // Undecodable body, different six-character signature: the series in progress stays.
+        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$2U0300A", session))
+        assertEquals(BbqrProgress(1, 2), session.progress())
+
+        assertEquals(
+            LabelScanAction.Import(jsonl, BbqrProgress(2, 2)),
+            scan(frames[1], session)
+        )
+        assertEquals(LabelScanAction.IgnoreAndResume, scan(frames[1], session))
+        assertEquals(LabelScanAction.IgnoreAndResume, scan(frames[0], session))
     }
 
     @Test

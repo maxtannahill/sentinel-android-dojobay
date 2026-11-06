@@ -80,15 +80,19 @@ sealed class BbqrReceive {
  * Streaming reassembly of one BBQr series while a label QR is in frame.
  *
  * Parts may arrive in any order. A repeat of an index already stored is
- * ignored when the body matches (animated QR loops); a different body for
- * that index fails the series. `Z` is raw deflate of the whole file
- * (zlib window bits 10, no header) before the base32 split, so inflation
- * waits until every part is present. Each part is decoded on its own:
- * base32 and hex quanta do not span parts.
+ * ignored (animated QR loops). A later scan that disagrees with the body
+ * already stored is ignored too; the first body stays. A frame that looks
+ * like BBQr but cannot be decoded, or whose index does not address a
+ * part, is skipped: nothing is toasted, the series stays open, and parts
+ * already held are kept. `Z` is raw deflate of the whole file (zlib
+ * window bits 10, no header) before the base32 split, so inflation waits
+ * until every part is present. Each part is decoded on its own: base32
+ * and hex quanta do not span parts. Join or inflate failure once every
+ * index is present still fails the series.
  *
- * A frame whose first six characters differ from the series in progress
- * starts a new series, so a second export can be scanned without leaving
- * the sheet. This accumulator is only fed frames the plain-QR callback
+ * A decodable frame whose first six characters differ from the series in
+ * progress starts a new series, so a second export can be scanned without
+ * leaving the sheet. This accumulator is only fed frames the plain-QR callback
  * delivers. Once a UR session has started, [com.invertedx.hummingbird.QRScanner]
  * drops non-UR frames, BBQr included, and that split stays in the scanner.
  */
@@ -105,27 +109,17 @@ class BbqrAccumulator {
     fun progress(): BbqrProgress = BbqrProgress(parts.size, partCount)
 
     fun receive(frame: String): BbqrReceive {
-        val header = parseBbqrHeader(frame)
-            ?: return BbqrReceive.Rejected(BbqrFailure.Decode)
-        if (header.signature != signature) begin(header)
-        if (closed) return pending(storedNewPart = false)
+        val header = parseBbqrHeader(frame) ?: return skipped()
+        val switching = header.signature != signature
+        if (!switching && closed) return skipped()
         if (!isBbqrLabelText(header.fileType)) {
+            begin(header)
             closed = true
             return BbqrReceive.Rejected(BbqrFailure.FileType(header.fileType))
         }
-        val previous = bodies[header.partIndex]
-        if (previous != null) {
-            if (previous != header.body) {
-                closed = true
-                return BbqrReceive.Rejected(BbqrFailure.Decode)
-            }
-            return pending(storedNewPart = false)
-        }
-        val decoded = decodeBody(header.encoding, header.body)
-        if (decoded == null) {
-            closed = true
-            return BbqrReceive.Rejected(BbqrFailure.Decode)
-        }
+        if (!switching && bodies[header.partIndex] != null) return skipped()
+        val decoded = decodeBody(header.encoding, header.body) ?: return skipped()
+        if (switching) begin(header)
         bodies[header.partIndex] = header.body
         parts[header.partIndex] = decoded
         if (parts.size < partCount) return pending(storedNewPart = true)
@@ -145,6 +139,9 @@ class BbqrAccumulator {
         closed = true
         return BbqrReceive.Complete(fileType, raw, progress())
     }
+
+    /** Not stored. Progress stays where it is, and the series stays open. */
+    private fun skipped(): BbqrReceive.Pending = pending(storedNewPart = false)
 
     private fun pending(storedNewPart: Boolean): BbqrReceive.Pending =
         BbqrReceive.Pending(progress(), storedNewPart)
