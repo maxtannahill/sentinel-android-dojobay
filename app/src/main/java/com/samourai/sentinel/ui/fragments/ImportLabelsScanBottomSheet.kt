@@ -17,6 +17,7 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
 
     private var onLabelsDecoded: ((String) -> Unit)? = null
     private val scanFragment = ScanPubKeyFragment()
+    private val bbqrLabels = BbqrAccumulator()
 
     fun setOnLabelsDecodedListener(callback: (String) -> Unit) {
         onLabelsDecoded = callback
@@ -41,18 +42,14 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
             // dispatch stops the camera when a decode is consumed, so the
             // resumeScan() calls the unconsumed arms needed (the scanner
             // never stopped) die with the upfront stop.
-            when (val action = labelScanAction(payload)) {
+            when (val action = labelScanAction(payload, bbqrLabels)) {
                 is LabelScanAction.Import -> {
                     onLabelsDecoded?.invoke(action.jsonl)
                     dismiss()
                     true
                 }
-                LabelScanAction.NotifyBbqrUnsupported -> {
-                    Toast.makeText(
-                        context,
-                        BBQR_UNSUPPORTED_MESSAGE,
-                        Toast.LENGTH_SHORT
-                    ).show()
+                is LabelScanAction.Notify -> {
+                    Toast.makeText(context, action.message, Toast.LENGTH_SHORT).show()
                     false
                 }
                 LabelScanAction.IgnoreAndResume -> false
@@ -85,10 +82,11 @@ sealed class LabelQrPayload {
     object Invalid : LabelQrPayload()
 }
 
-/** Spec spelling is BBQr. Reassembly is #70; this scan only says so. */
-const val BBQR_UNSUPPORTED_MESSAGE = "BBQr label export not yet supported"
+const val BBQR_DECODE_FAILED_MESSAGE = "BBQr label export could not be decoded"
+const val BBQR_NOT_LABELS_MESSAGE = "BBQr payload is not a label export"
 
-private const val BBQR_HEADER_LENGTH = 8
+fun bbqrFileTypeMessage(fileType: Char): String =
+    "BBQr file type $fileType is not a label export"
 
 /**
  * Coinkite BBQr, not the old "BQR:" guess. The header is eight characters:
@@ -118,14 +116,33 @@ fun classifyLabelQrPayload(payload: String): LabelQrPayload = when {
 
 sealed class LabelScanAction {
     data class Import(val jsonl: String) : LabelScanAction()
-    object NotifyBbqrUnsupported : LabelScanAction()
+    data class Notify(val message: String) : LabelScanAction()
     object IgnoreAndResume : LabelScanAction()
 }
 
-fun labelScanAction(payload: String): LabelScanAction =
+fun labelScanAction(payload: String, bbqr: BbqrAccumulator): LabelScanAction =
     when (val classified = classifyLabelQrPayload(payload)) {
         is LabelQrPayload.Labels -> LabelScanAction.Import(classified.jsonl)
-        LabelQrPayload.BbqrFrame -> LabelScanAction.NotifyBbqrUnsupported
+        LabelQrPayload.BbqrFrame -> when (val received = bbqr.receive(payload)) {
+            BbqrReceive.Pending -> LabelScanAction.IgnoreAndResume
+            is BbqrReceive.Rejected -> LabelScanAction.Notify(bbqrRejectMessage(received))
+            is BbqrReceive.Complete -> {
+                val text = String(received.bytes, StandardCharsets.UTF_8)
+                if (isBbqrLabelText(received.fileType) && isValidLabelsJsonl(text)) {
+                    LabelScanAction.Import(text)
+                } else if (!isBbqrLabelText(received.fileType)) {
+                    LabelScanAction.Notify(bbqrFileTypeMessage(received.fileType))
+                } else {
+                    LabelScanAction.Notify(BBQR_NOT_LABELS_MESSAGE)
+                }
+            }
+        }
         LabelQrPayload.UrFrame, LabelQrPayload.Invalid ->
             LabelScanAction.IgnoreAndResume
+    }
+
+private fun bbqrRejectMessage(rejected: BbqrReceive.Rejected): String =
+    when (val failure = rejected.failure) {
+        BbqrFailure.Decode -> BBQR_DECODE_FAILED_MESSAGE
+        is BbqrFailure.FileType -> bbqrFileTypeMessage(failure.fileType)
     }
