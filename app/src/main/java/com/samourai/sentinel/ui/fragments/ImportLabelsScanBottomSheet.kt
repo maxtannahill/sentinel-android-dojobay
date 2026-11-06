@@ -50,7 +50,7 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
                 LabelScanAction.NotifyBbqrUnsupported -> {
                     Toast.makeText(
                         context,
-                        "BBQR label export not yet supported",
+                        BBQR_UNSUPPORTED_MESSAGE,
                         Toast.LENGTH_SHORT
                     ).show()
                     false
@@ -85,9 +85,33 @@ sealed class LabelQrPayload {
     object Invalid : LabelQrPayload()
 }
 
+/** Spec spelling is BBQr. Reassembly is #70; this scan only says so. */
+const val BBQR_UNSUPPORTED_MESSAGE = "BBQr label export not yet supported"
+
+private const val BBQR_HEADER_LENGTH = 8
+
+/**
+ * Coinkite BBQr, not the old "BQR:" guess. The header is eight characters:
+ * `B$`, an encoding (`H` hex, `2` base32, `Z` zlib then base32), one
+ * base-36 file type, two base-36 digits of part count, two base-36 digits
+ * of part index. Sparrow label export is type `U`. See BBQr.md.
+ * Lowercase and a leading "BQR" are not this header.
+ */
+fun isBbqrFrame(payload: String): Boolean {
+    if (payload.length < BBQR_HEADER_LENGTH) return false
+    if (payload[0] != 'B' || payload[1] != '$') return false
+    val encoding = payload[2]
+    if (encoding != 'H' && encoding != '2' && encoding != 'Z') return false
+    for (i in 3 until BBQR_HEADER_LENGTH) {
+        val c = payload[i]
+        if (c !in '0'..'9' && c !in 'A'..'Z') return false
+    }
+    return true
+}
+
 fun classifyLabelQrPayload(payload: String): LabelQrPayload = when {
     payload.startsWith("UR:", ignoreCase = true) -> LabelQrPayload.UrFrame
-    payload.startsWith("BQR", ignoreCase = true) -> LabelQrPayload.BbqrFrame
+    isBbqrFrame(payload) -> LabelQrPayload.BbqrFrame
     isValidLabelsJsonl(payload) -> LabelQrPayload.Labels(payload)
     else -> LabelQrPayload.Invalid
 }

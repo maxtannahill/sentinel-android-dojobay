@@ -29,6 +29,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -47,6 +49,12 @@ class QRScanner : FrameLayout, DefaultLifecycleObserver {
     private var _decodeQrCallback: (result: String) -> Unit = {}
     private var _type = QrDetectType.AUTO
     private val _decoder = URDecoder()
+    // URDecoder is not thread-safe. setScanResult used to launch one
+    // Dispatchers.Default coroutine per decoded frame, so two frames could
+    // be inside receivePart at once. The lock covers the decoder read that
+    // follows receivePart as well: the UI snapshot has to match the part
+    // just applied, and a later frame must not paint older progress over it.
+    private val decoderMutex = Mutex()
     private var _progressIndicator: CircularProgressIndicator? = null
     private var _progressMessage: TextView? = null
     private var _enableURProgress = true
@@ -236,50 +244,52 @@ class QRScanner : FrameLayout, DefaultLifecycleObserver {
                     }
                     return@launch
                 }
-                val receivedPart = _decoder.receivePart(string)
-                if (!receivedPart && _decoder.expectedPartCount == 0) {
-                    withContext(Dispatchers.Main){
-                        _decodeQrCallback.invoke(string)
-                    }
-                    return@launch
-                }
-                withContext(Dispatchers.Main) {
-                    if (_enableURProgress) {
-                        _progressIndicator?.visibility = View.VISIBLE
-                        _progressMessage?.visibility = View.VISIBLE
-                        _progressIndicator?.max = 100
-                        _progressIndicator?.setProgressCompat(
-                            (_decoder.estimatedPercentComplete * 100).roundToInt(),
-                            false
-                        )
-                        _progressMessage?.text =
-                            "${(_decoder.estimatedPercentComplete * 100).roundToInt()}%"
-                    } else {
-                        _progressIndicator?.visibility = View.GONE
-                        _progressMessage?.visibility = View.GONE
-                    }
-                    if (_decoder.expectedPartCount != 0) {
-                        _urTransmissionListener.invoke(
-                            _decoder.expectedPartCount,
-                            _decoder.processedPartsCount,
-                            _decoder.estimatedPercentComplete
-                        )
-                    }
-                    if (_decoder.result != null && _decoder.result.type == ResultType.SUCCESS) {
-                        // Once per session: a finished decoder stays in frame and
-                        // this branch runs again on every later decode.
-                        if (perfSessionOpen) {
-                            QrPerf.onSessionComplete()
+                decoderMutex.withLock {
+                    val snap = receivePartLocked(string)
+                    if (!snap.receivedPart && snap.expectedPartCount == 0) {
+                        withContext(Dispatchers.Main){
+                            _decodeQrCallback.invoke(string)
                         }
-                        _progressIndicator?.setProgressCompat(
-                            100,
-                            false
-                        )
-                        _progressMessage?.text =
-                            "100%"
-                        val result = kotlin.Result.success(_decoder.result)
-                        _decodeURCallback.invoke(result)
-                        return@withContext
+                        return@withLock
+                    }
+                    withContext(Dispatchers.Main) {
+                        if (_enableURProgress) {
+                            _progressIndicator?.visibility = View.VISIBLE
+                            _progressMessage?.visibility = View.VISIBLE
+                            _progressIndicator?.max = 100
+                            _progressIndicator?.setProgressCompat(
+                                (snap.estimatedPercentComplete * 100).roundToInt(),
+                                false
+                            )
+                            _progressMessage?.text =
+                                "${(snap.estimatedPercentComplete * 100).roundToInt()}%"
+                        } else {
+                            _progressIndicator?.visibility = View.GONE
+                            _progressMessage?.visibility = View.GONE
+                        }
+                        if (snap.expectedPartCount != 0) {
+                            _urTransmissionListener.invoke(
+                                snap.expectedPartCount,
+                                snap.processedPartsCount,
+                                snap.estimatedPercentComplete
+                            )
+                        }
+                        if (snap.result != null && snap.result.type == ResultType.SUCCESS) {
+                            // Once per session: a finished decoder stays in frame and
+                            // this branch runs again on every later decode.
+                            if (perfSessionOpen) {
+                                QrPerf.onSessionComplete()
+                            }
+                            _progressIndicator?.setProgressCompat(
+                                100,
+                                false
+                            )
+                            _progressMessage?.text =
+                                "100%"
+                            val result = kotlin.Result.success(snap.result)
+                            _decodeURCallback.invoke(result)
+                            return@withContext
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -299,5 +309,40 @@ class QRScanner : FrameLayout, DefaultLifecycleObserver {
             }
         }
     }
+
+    /**
+     * Caller holds [decoderMutex]. Reads the decoder only here so the
+     * snapshot cannot tear against another frame.
+     */
+    private fun receivePartLocked(string: String): DecoderSnap {
+        val hadResult = _decoder.result != null
+        val processedBefore = _decoder.processedPartsCount
+        val receivedPart = _decoder.receivePart(string)
+        QrPerf.noteUrOutcome(
+            classifyUrPartOutcome(
+                text = string,
+                received = receivedPart,
+                processedBefore = processedBefore,
+                processedAfter = _decoder.processedPartsCount,
+                hadResultBefore = hadResult,
+                hasResultAfter = _decoder.result != null
+            )
+        )
+        return DecoderSnap(
+            receivedPart = receivedPart,
+            expectedPartCount = _decoder.expectedPartCount,
+            processedPartsCount = _decoder.processedPartsCount,
+            estimatedPercentComplete = _decoder.estimatedPercentComplete,
+            result = _decoder.result
+        )
+    }
+
+    private data class DecoderSnap(
+        val receivedPart: Boolean,
+        val expectedPartCount: Int,
+        val processedPartsCount: Int,
+        val estimatedPercentComplete: Double,
+        val result: URDecoder.Result?
+    )
 
 }

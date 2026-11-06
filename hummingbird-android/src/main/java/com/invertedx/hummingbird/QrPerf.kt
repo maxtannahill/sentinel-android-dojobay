@@ -3,15 +3,23 @@ package com.invertedx.hummingbird
 import android.os.SystemClock
 import android.util.Log
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 
 /**
  * #71 measurement only. Counts and timings for `adb logcat -s QRPerf`.
- * Not a scan-speed change.
  *
- * The analyze() path only increments integers. A line is written every
- * [FRAME_LOG_INTERVAL] entries and on session start, stop, and UR complete.
- * Lines carry counters only: no frame bytes, payloads, or other user data.
+ * The analyze() path only increments integers and records how long the
+ * frame took. A line is written every [FRAME_LOG_INTERVAL] entries and
+ * on session start, stop, and UR complete. Lines carry counters only:
+ * no frame bytes, payloads, labels, xpubs, or other user data.
+ *
+ * `accepted` is still the decoder's processedPartsCount (distinct fountain
+ * parts by content hash, not recovered fragments). `newParts` /
+ * `repeatParts` / `rejectedParts` are UR frames only. A decoded frame
+ * that never entered the UR decoder is the remainder:
+ * `decoded - newParts - repeatParts - rejectedParts`.
+ * `width` / `height` / `rowStride` are sampled from the first YUV frame.
  */
 object QrPerf {
     const val TAG = "QRPerf"
@@ -24,12 +32,20 @@ object QrPerf {
     private val accepted = AtomicInteger(0)
     private val expected = AtomicInteger(0)
     private val percent = AtomicInteger(0)
+    private val newParts = AtomicInteger(0)
+    private val repeatParts = AtomicInteger(0)
+    private val rejectedParts = AtomicInteger(0)
+    private val analyzeTimeSumNs = AtomicLong(0)
+    private val analyzeSamples = AtomicInteger(0)
 
     @Volatile
     private var sessionStartElapsedMs: Long = 0L
 
     @Volatile
     private var completeLogged: Boolean = false
+
+    @Volatile
+    private var geometry: FrameGeometry? = null
 
     internal fun onSessionStart() {
         sessionId.incrementAndGet()
@@ -38,6 +54,12 @@ object QrPerf {
         accepted.set(0)
         expected.set(0)
         percent.set(0)
+        newParts.set(0)
+        repeatParts.set(0)
+        rejectedParts.set(0)
+        analyzeTimeSumNs.set(0)
+        analyzeSamples.set(0)
+        geometry = null
         completeLogged = false
         sessionStartElapsedMs = SystemClock.elapsedRealtime()
         log("start")
@@ -54,6 +76,34 @@ object QrPerf {
 
     internal fun noteDecoded() {
         decoded.incrementAndGet()
+    }
+
+    /** One analyze() duration, in nanoseconds. Failures count too. */
+    internal fun noteAnalyzeDurationNs(elapsedNs: Long) {
+        if (elapsedNs < 0L) return
+        analyzeTimeSumNs.addAndGet(elapsedNs)
+        analyzeSamples.incrementAndGet()
+    }
+
+    /**
+     * First valid frame wins. A later resolution change in the same
+     * session does not rewrite the sample.
+     */
+    internal fun noteFrameGeometry(width: Int, height: Int, yRowStride: Int) {
+        val current = geometry
+        val next = captureFrameGeometry(current, width, height, yRowStride)
+        if (next !== current) {
+            geometry = next
+        }
+    }
+
+    internal fun noteUrOutcome(outcome: UrPartOutcome) {
+        when (outcome) {
+            UrPartOutcome.NEW -> newParts.incrementAndGet()
+            UrPartOutcome.REPEAT -> repeatParts.incrementAndGet()
+            UrPartOutcome.REJECTED -> rejectedParts.incrementAndGet()
+            UrPartOutcome.NOT_UR -> Unit
+        }
     }
 
     /**
@@ -82,9 +132,26 @@ object QrPerf {
 
     private fun log(event: String) {
         val elapsed = SystemClock.elapsedRealtime() - sessionStartElapsedMs
+        val frame = geometry
         Log.i(
             TAG,
-            "session=${sessionId.get()} event=$event attempts=${attempts.get()} decoded=${decoded.get()} accepted=${accepted.get()} expected=${expected.get()} pct=${percent.get()} elapsedMs=$elapsed"
+            qrPerfLogLine(
+                session = sessionId.get(),
+                event = event,
+                attempts = attempts.get(),
+                decoded = decoded.get(),
+                accepted = accepted.get(),
+                expected = expected.get(),
+                percent = percent.get(),
+                elapsedMs = elapsed,
+                newParts = newParts.get(),
+                repeatParts = repeatParts.get(),
+                rejectedParts = rejectedParts.get(),
+                avgAnalyzeMs = averageAnalyzeMs(analyzeTimeSumNs.get(), analyzeSamples.get()),
+                width = frame?.width ?: 0,
+                height = frame?.height ?: 0,
+                rowStride = frame?.rowStride ?: 0
+            )
         )
     }
 }
