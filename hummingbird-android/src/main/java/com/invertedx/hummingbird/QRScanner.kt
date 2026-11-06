@@ -238,6 +238,12 @@ class QRScanner : FrameLayout, DefaultLifecycleObserver {
         _progressMessage?.text = "$shown/$total"
     }
 
+    /** Hides the part ring after the label scan is started over. */
+    fun clearPartCount() {
+        _progressIndicator?.visibility = View.GONE
+        _progressMessage?.visibility = View.GONE
+    }
+
     fun setQRDecodeListener(callback: (result: String) -> Unit) {
         this._decodeQrCallback = callback
     }

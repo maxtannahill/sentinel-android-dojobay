@@ -79,7 +79,7 @@ internal fun qrPerfLogLine(
     rowStride: Int,
     bbqrMissing: IntArray = intArrayOf(),
     bbqrHeld: Int = 0,
-    bbqrKeep: Int = 0,
+    bbqrConflict: Int = 0,
     bbqrDecode: Int = 0,
     bbqrIndex: Int = 0,
     bbqrClosed: Int = 0,
@@ -91,7 +91,7 @@ internal fun qrPerfLogLine(
         "newParts=$newParts repeatParts=$repeatParts rejectedParts=$rejectedParts " +
         "avgAnalyzeMs=$avgAnalyzeMs width=$width height=$height rowStride=$rowStride " +
         "${formatBbqrMissing(bbqrMissing.toList())} " +
-        "bbqrHeld=$bbqrHeld bbqrKeep=$bbqrKeep bbqrDecode=$bbqrDecode " +
+        "bbqrHeld=$bbqrHeld bbqrConflict=$bbqrConflict bbqrDecode=$bbqrDecode " +
         "bbqrIndex=$bbqrIndex bbqrClosed=$bbqrClosed bbqrOther=$bbqrOther " +
         "bbqrDecodeIdx=${formatBbqrIndexList(bbqrDecodeIdx.toList())}"
 

@@ -9,13 +9,14 @@ import kotlin.math.roundToInt
 /**
  * Why a BBQr frame was not stored. Logged as a counter name, never as
  * frame bytes. [Held] is an index already stored with the same body.
- * [Keep] is an index already stored whose new body disagrees; the first
- * body stays. [Decode] is a body that does not decode. [Index] is past
- * the header count. [Closed] is a finished series. [Other] is not a header.
+ * [Conflict] is an index already stored whose new body disagrees; the
+ * series is discarded. [Decode] is a body that does not decode. [Index]
+ * is past the header count. [Closed] is a finished series. [Other] is
+ * not a header.
  */
 enum class BbqrSkipReason {
     Held,
-    Keep,
+    Conflict,
     Decode,
     Index,
     Closed,
@@ -23,7 +24,7 @@ enum class BbqrSkipReason {
 
     internal fun logName(): String = when (this) {
         Held -> "held"
-        Keep -> "keep"
+        Conflict -> "conflict"
         Decode -> "decode"
         Index -> "index"
         Closed -> "closed"
@@ -45,7 +46,7 @@ enum class BbqrSkipReason {
  * import reports unique parts stored and the header's part count, and
  * only when a new index is stored. `newParts` / `repeatParts` /
  * `rejectedParts` are UR frames only. BBQr skips use `bbqrHeld` /
- * `bbqrKeep` / `bbqrDecode` / `bbqrIndex` / `bbqrClosed` / `bbqrOther`,
+ * `bbqrConflict` / `bbqrDecode` / `bbqrIndex` / `bbqrClosed` / `bbqrOther`,
  * and `bbqrMiss` / `bbqrMissIdx` name the indexes still missing when
  * only a few remain. A decoded frame that never entered the UR decoder
  * is the remainder: `decoded - newParts - repeatParts - rejectedParts`.
@@ -66,7 +67,7 @@ object QrPerf {
     private val repeatParts = AtomicInteger(0)
     private val rejectedParts = AtomicInteger(0)
     private val bbqrHeld = AtomicInteger(0)
-    private val bbqrKeep = AtomicInteger(0)
+    private val bbqrConflict = AtomicInteger(0)
     private val bbqrDecode = AtomicInteger(0)
     private val bbqrIndex = AtomicInteger(0)
     private val bbqrClosed = AtomicInteger(0)
@@ -104,7 +105,7 @@ object QrPerf {
         repeatParts.set(0)
         rejectedParts.set(0)
         bbqrHeld.set(0)
-        bbqrKeep.set(0)
+        bbqrConflict.set(0)
         bbqrDecode.set(0)
         bbqrIndex.set(0)
         bbqrClosed.set(0)
@@ -199,7 +200,7 @@ object QrPerf {
     fun noteBbqrSkip(reason: BbqrSkipReason, index: Int?, oneShot: Boolean) {
         when (reason) {
             BbqrSkipReason.Held -> bbqrHeld.incrementAndGet()
-            BbqrSkipReason.Keep -> bbqrKeep.incrementAndGet()
+            BbqrSkipReason.Conflict -> bbqrConflict.incrementAndGet()
             BbqrSkipReason.Decode -> bbqrDecode.incrementAndGet()
             BbqrSkipReason.Index -> bbqrIndex.incrementAndGet()
             BbqrSkipReason.Closed -> bbqrClosed.incrementAndGet()
@@ -256,7 +257,7 @@ object QrPerf {
                 rowStride = frame?.rowStride ?: 0,
                 bbqrMissing = bbqrMissing,
                 bbqrHeld = bbqrHeld.get(),
-                bbqrKeep = bbqrKeep.get(),
+                bbqrConflict = bbqrConflict.get(),
                 bbqrDecode = bbqrDecode.get(),
                 bbqrIndex = bbqrIndex.get(),
                 bbqrClosed = bbqrClosed.get(),

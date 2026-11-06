@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.samourai.sentinel.data.db.SentinelRoomDb
 import com.samourai.sentinel.data.repository.Bip329Importer
 import com.samourai.sentinel.data.repository.ImportResult
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
@@ -12,6 +13,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -21,6 +23,7 @@ import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.StringReader
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.Executors
 import java.util.zip.Deflater
 
 /**
@@ -308,41 +311,78 @@ class ImportLabelsScanBottomSheetTest {
     }
 
     @Test
-    fun conflictingRepeatKeepsTheFirstBody() {
+    fun conflictingPartIsVisibleAndRequiresRestart() {
+        val line0 = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"one\"}\n"
+        val line1 = "{\"type\":\"tx\",\"ref\":\"bb\",\"label\":\"two\"}\n"
+        val other0 = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"OTHER\"}\n"
+        val a0 = bbqrHeader('H', 'U', 2, 0) + hexEncode(line0)
+        val a1 = bbqrHeader('H', 'U', 2, 1) + hexEncode(line1)
+        val b0 = bbqrHeader('H', 'U', 2, 0) + hexEncode(other0)
+        assertFalse(a0 == b0)
+
         val session = BbqrAccumulator()
         assertEquals(
-            BbqrReceive.Pending(BbqrProgress(1, 2), storedNewPart = true),
-            session.receive("B\$HU02000001")
+            LabelScanAction.Collecting(BbqrProgress(1, 2)),
+            scan(a0, session)
         )
         assertEquals(
-            BbqrReceive.Pending(
-                BbqrProgress(1, 2),
-                storedNewPart = false,
-                skip = BbqrSkip.Keep,
-                partIndex = 0,
-            ),
-            session.receive("B\$HU020000FF")
+            LabelScanAction.Skipped(BbqrSkip.Held, partIndex = 0),
+            scan(a0, session)
+        )
+        val during = session.seriesId()
+        assertEquals(
+            BbqrReceive.Conflict(partIndex = 0, progress = BbqrProgress(0, 2)),
+            session.receive(b0)
+        )
+        // A matching repeat is not a conflict, and the conflict itself does
+        // not start a new series id. The complementary part must not splice.
+        assertEquals(during, session.seriesId())
+        assertEquals(BbqrProgress(0, 2), session.progress())
+        assertTrue(session.missingIndexes().isEmpty())
+        assertEquals(LabelScanAction.IgnoreAndResume, scan("UR:BYTES/1-2/ABCDEF", session))
+        assertEquals(LabelScanAction.IgnoreAndResume, scan("BQR:1/1/T/QUJD", session))
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Index, partIndex = 5),
+            scan("B\$HU0205FFFF", session)
         )
         assertEquals(
-            LabelScanAction.Skipped(BbqrSkip.Keep, partIndex = 0),
-            scan("B\$HU020000FF", session)
-        )
-        assertEquals(listOf(1), session.missingIndexes())
-        assertEquals(BbqrProgress(1, 2), session.progress())
-        val done = session.receive("B\$HU0201FFFF")
-        assertTrue(done is BbqrReceive.Complete)
-        assertArrayEquals(
-            byteArrayOf(0x00, 0x01, 0xff.toByte(), 0xff.toByte()),
-            (done as BbqrReceive.Complete).bytes
+            LabelScanAction.Skipped(BbqrSkip.Conflict, partIndex = 1),
+            scan(a1, session)
         )
         assertEquals(
-            BbqrReceive.Pending(
-                BbqrProgress(2, 2),
-                storedNewPart = false,
-                skip = BbqrSkip.Closed,
-                partIndex = 1,
-            ),
-            session.receive("B\$HU0201FFFF")
+            LabelScanAction.Restart(BBQR_CONFLICT_MESSAGE, partIndex = 0),
+            scan(b0, BbqrAccumulator().also { it.receive(a0) })
+        )
+
+        session.reset()
+        assertTrue(session.seriesId() != during)
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 2)),
+            scan(a0, session)
+        )
+        assertEquals(
+            LabelScanAction.Import(line0 + line1, BbqrProgress(2, 2)),
+            scan(a1, session)
+        )
+        // A finished series does not import again, even if a later body disagrees.
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Closed, partIndex = 0),
+            scan(b0, session)
+        )
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Closed, partIndex = 0),
+            scan(a0, session)
+        )
+
+        // A different six-character signature still replaces the locked series.
+        val locked = BbqrAccumulator()
+        assertEquals(LabelScanAction.Collecting(BbqrProgress(1, 2)), scan(a0, locked))
+        assertTrue(scan(b0, locked) is LabelScanAction.Restart)
+        val text = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"hi\"}"
+        val frame = encodeBbqr(text.toByteArray(StandardCharsets.UTF_8), 'H', parts = 1).single()
+        assertEquals(
+            LabelScanAction.Import(text, BbqrProgress(1, 1)),
+            scan(frame, locked)
         )
     }
 
@@ -383,14 +423,6 @@ class ImportLabelsScanBottomSheetTest {
         assertEquals(
             LabelScanAction.Skipped(BbqrSkip.Index, partIndex = 5),
             scan(unaddressable, session)
-        )
-        assertEquals(BbqrProgress(1, 2), session.progress())
-
-        val conflict = frames[0].take(BBQR_HEADER_LENGTH) + "00"
-        assertFalse(conflict == frames[0])
-        assertEquals(
-            LabelScanAction.Skipped(BbqrSkip.Keep, partIndex = 0),
-            scan(conflict, session)
         )
         assertEquals(BbqrProgress(1, 2), session.progress())
 
@@ -578,12 +610,21 @@ class ImportLabelsScanBottomSheetTest {
             BBQR_DECODE_FAILED_MESSAGE,
             BBQR_NOT_LABELS_MESSAGE,
             bbqrFileTypeMessage('P'),
+            BBQR_CONFLICT_MESSAGE,
         )
         for (message in messages) {
             assertTrue(message.contains("BBQr"))
+            assertFalse(message.contains("BBQR"))
             assertFalse(message.contains("BQR:"))
             assertFalse(message.contains("not yet supported"))
         }
+        assertEquals(
+            "BBQr parts disagree. Start the scan over.",
+            BBQR_CONFLICT_MESSAGE
+        )
+        assertEquals("Start over", BBQR_START_OVER)
+        assertFalse(BBQR_START_OVER.contains("BBQR"))
+        assertFalse(BBQR_START_OVER.contains("BQR:"))
         assertEquals(
             "BBQr label export could not be decoded",
             BBQR_DECODE_FAILED_MESSAGE
@@ -595,6 +636,175 @@ class ImportLabelsScanBottomSheetTest {
         assertEquals(
             "BBQr file type P is not a label export",
             bbqrFileTypeMessage('P')
+        )
+    }
+
+    @Test
+    fun cancelledFinishRollsBackTheCompletingPart() {
+        val text = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"hi\"}"
+        val frames = encodeBbqr(text.toByteArray(StandardCharsets.UTF_8), 'H', parts = 2)
+        val session = BbqrAccumulator()
+        assertTrue(session.receive(frames[0]) is BbqrReceive.Pending)
+        var calls = 0
+        try {
+            session.receive(frames[1]) {
+                calls += 1
+                calls < 2
+            }
+            fail("expected the finish to abandon")
+        } catch (_: BbqrAbandoned) {
+            // The completing part is not kept, so the series can finish later.
+        }
+        assertEquals(1, session.progress().collected)
+        assertEquals(
+            LabelScanAction.Import(text, BbqrProgress(2, 2)),
+            scan(frames[1], session)
+        )
+    }
+
+    @Test
+    fun finishRunsOffTheCallerThread() = runBlocking {
+        val caller = Thread.currentThread().id
+        val worker = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+        try {
+            val text = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"hi\"}"
+            val frame = encodeBbqr(text.toByteArray(StandardCharsets.UTF_8), 'Z', parts = 1).single()
+            var ranOn = -1L
+            val action = runLabelFrame(frame, BbqrAccumulator(), worker = worker) {
+                ranOn = Thread.currentThread().id
+                true
+            }
+            assertTrue(ranOn != caller)
+            assertEquals(LabelScanAction.Import(text, BbqrProgress(1, 1)), action)
+        } finally {
+            worker.close()
+        }
+    }
+
+    @Test
+    fun decodedCapAcceptsTheBoundaryAndRejectsOnePastIt() {
+        val exactBody = CharArray(BBQR_MAX_DECODED_BYTES * 2) { '0' }.concatToString()
+        val exact = BbqrAccumulator().receive(bbqrHeader('H', 'U', 1, 0) + exactBody)
+        assertTrue(exact is BbqrReceive.Complete)
+        assertEquals(BBQR_MAX_DECODED_BYTES, (exact as BbqrReceive.Complete).bytes.size)
+
+        val overBody = CharArray((BBQR_MAX_DECODED_BYTES + 1) * 2) { 'A' }.concatToString()
+        val session = BbqrAccumulator()
+        val over = session.receive(bbqrHeader('H', 'U', 1, 0) + overBody)
+        assertTrue(over is BbqrReceive.Rejected)
+        assertEquals(0, session.progress().collected)
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Closed, partIndex = 0),
+            scan(bbqrHeader('H', 'U', 1, 0) + "00", session)
+        )
+    }
+
+    @Test
+    fun aggregateCapStopsALargeIncompleteSeries() {
+        val partBytes = 256 * 1024
+        val fitting = BBQR_MAX_DECODED_BYTES / partBytes
+        assertEquals(16, fitting)
+        assertEquals(BBQR_MAX_DECODED_BYTES, fitting * partBytes)
+        val count = fitting + 4
+        val body = CharArray(partBytes * 2) { '0' }.concatToString()
+        val session = BbqrAccumulator()
+        for (index in 0 until fitting) {
+            assertTrue(
+                session.receive(bbqrHeader('H', 'U', count, index) + body) is BbqrReceive.Pending
+            )
+        }
+        assertEquals(BbqrProgress(fitting, count), session.progress())
+        val overflow = session.receive(bbqrHeader('H', 'U', count, fitting) + "FF")
+        assertTrue(overflow is BbqrReceive.Rejected)
+        assertEquals(BbqrProgress(0, count), session.progress())
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Closed, partIndex = 0),
+            scan(bbqrHeader('H', 'U', count, 0) + "00", session)
+        )
+    }
+
+    @Test
+    fun garbledOrForeignOverCapBodyDoesNotLockAnOpenSeries() {
+        val session = BbqrAccumulator()
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 2)),
+            scan("B\$HU020041", session)
+        )
+        val garbled = CharArray(BBQR_MAX_ENCODED_CHARS + 2) { 'A' }
+        garbled[0] = 'G'
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Decode, partIndex = 1),
+            scan(bbqrHeader('H', 'U', 2, 1) + String(garbled), session)
+        )
+        assertEquals(BbqrProgress(1, 2), session.progress())
+
+        val huge = CharArray((BBQR_MAX_DECODED_BYTES + 1) * 2) { 'A' }.concatToString()
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Decode, partIndex = 0, thisSeries = false),
+            scan(bbqrHeader('H', 'U', 1, 0) + huge, session)
+        )
+        assertEquals(BbqrProgress(1, 2), session.progress())
+        assertEquals(
+            LabelScanAction.Notify(BBQR_NOT_LABELS_MESSAGE),
+            scan("B\$HU020142", session)
+        )
+    }
+
+    @Test
+    fun inflateCapStopsAHighlyCompressibleStream() {
+        val exact = ByteArray(BBQR_MAX_DECODED_BYTES)
+        val exactCompressed = deflateRaw(exact)
+        assertTrue(exactCompressed.size < 64 * 1024)
+        val exactDone = BbqrAccumulator().receive(
+            encodeBbqr(exact, 'Z', parts = 1).single()
+        )
+        assertTrue(exactDone is BbqrReceive.Complete)
+        val exactBytes = (exactDone as BbqrReceive.Complete).bytes
+        assertEquals(BBQR_MAX_DECODED_BYTES, exactBytes.size)
+        assertEquals(0, exactBytes[0].toInt())
+        assertEquals(0, exactBytes[exactBytes.lastIndex].toInt())
+
+        val over = ByteArray(BBQR_MAX_DECODED_BYTES + 1)
+        val overCompressed = deflateRaw(over)
+        assertTrue(overCompressed.size < 64 * 1024)
+        val overDone = BbqrAccumulator().receive(encodeBbqr(over, 'Z', parts = 1).single())
+        assertTrue(overDone is BbqrReceive.Rejected)
+        assertFalse(overDone is BbqrReceive.Complete)
+    }
+
+    @Test
+    fun rawDeflateRejectsUnconsumedInput() {
+        val raw = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"hi\"}".toByteArray(StandardCharsets.UTF_8)
+        val compressed = deflateRaw(raw)
+        val clean = BbqrAccumulator().receive(zFrame(compressed))
+        assertTrue(clean is BbqrReceive.Complete)
+        assertArrayEquals(raw, (clean as BbqrReceive.Complete).bytes)
+
+        assertTrue(
+            BbqrAccumulator().receive(zFrame(compressed + byteArrayOf(0))) is BbqrReceive.Rejected
+        )
+        assertTrue(
+            BbqrAccumulator().receive(zFrame(compressed + byteArrayOf(0x7f))) is BbqrReceive.Rejected
+        )
+        val concatenated = BbqrAccumulator().receive(zFrame(compressed + compressed))
+        assertTrue(concatenated is BbqrReceive.Rejected)
+        assertFalse(concatenated is BbqrReceive.Complete)
+
+        assertTrue(
+            BbqrAccumulator().receive(zFrame(deflateZlib(raw))) is BbqrReceive.Rejected
+        )
+        assertTrue(
+            BbqrAccumulator().receive(
+                zFrame(byteArrayOf(0x1f, 0x8b.toByte(), 0x08, 0x00, 0x00, 0x00, 0x00, 0x00))
+            ) is BbqrReceive.Rejected
+        )
+        val truncated = compressed.copyOf(compressed.size / 2)
+        assertTrue(truncated.isNotEmpty())
+        assertTrue(truncated.size < compressed.size)
+        assertTrue(BbqrAccumulator().receive(zFrame(truncated)) is BbqrReceive.Rejected)
+        assertTrue(
+            BbqrAccumulator().receive(zFrame(byteArrayOf(0x01, 0x02, 0x03, 0x04, 0x05)))
+                is BbqrReceive.Rejected
         )
     }
 
@@ -632,6 +842,7 @@ class ImportLabelsScanBottomSheetTest {
                 }
                 is LabelScanAction.Collecting -> Unit
                 is LabelScanAction.Skipped -> Unit
+                is LabelScanAction.Restart -> error(action.message)
                 LabelScanAction.IgnoreAndResume -> Unit
                 is LabelScanAction.Notify -> error(action.message)
             }
@@ -704,8 +915,33 @@ class ImportLabelsScanBottomSheetTest {
         return out.toString()
     }
 
+    private fun hexEncode(text: String): String =
+        text.toByteArray(StandardCharsets.UTF_8).joinToString("") { "%02X".format(it) }
+
+    /** One Z frame around bytes that are already raw-deflated. */
+    private fun zFrame(compressed: ByteArray): String =
+        bbqrHeader('Z', 'U', 1, 0) + base32(compressed)
+
     private fun deflateRaw(data: ByteArray): ByteArray {
         val deflater = Deflater(Deflater.BEST_COMPRESSION, true)
+        return try {
+            deflater.setInput(data)
+            deflater.finish()
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(1024)
+            while (!deflater.finished()) {
+                val n = deflater.deflate(buf)
+                if (n == 0) error("deflate stalled")
+                out.write(buf, 0, n)
+            }
+            out.toByteArray()
+        } finally {
+            deflater.end()
+        }
+    }
+
+    private fun deflateZlib(data: ByteArray): ByteArray {
+        val deflater = Deflater(Deflater.BEST_COMPRESSION, false)
         return try {
             deflater.setInput(data)
             deflater.finish()
