@@ -218,7 +218,72 @@ class ImportLabelsScanBottomSheetTest {
         assertEquals('U', done.fileType)
         assertTrue(session.receive(frames[1]) is BbqrReceive.Pending)
 
-        assertEquals(LabelScanAction.IgnoreAndResume, scan(frames[0]))
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 3)),
+            scan(frames[0])
+        )
+    }
+
+    @Test
+    fun bbqrProgressCountsUniquePartsAndResetsOnANewSeries() {
+        val session = BbqrAccumulator()
+        assertEquals(
+            BbqrReceive.Pending(BbqrProgress(1, 3), storedNewPart = true),
+            session.receive("B\$HU03000001")
+        )
+        assertEquals(
+            BbqrReceive.Pending(BbqrProgress(1, 3), storedNewPart = false),
+            session.receive("B\$HU03000001")
+        )
+        assertEquals(
+            BbqrReceive.Pending(BbqrProgress(2, 3), storedNewPart = true),
+            session.receive("B\$HU03027FFF")
+        )
+        // First six characters differ (B$HU03 vs B$HU02): the count restarts.
+        assertEquals(
+            BbqrReceive.Pending(BbqrProgress(1, 2), storedNewPart = true),
+            session.receive("B\$HU020041")
+        )
+        assertEquals(BbqrProgress(1, 2), session.progress())
+
+        val sheet = BbqrAccumulator()
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 3)),
+            labelScanAction("B\$HU03000001", sheet)
+        )
+        assertEquals(
+            LabelScanAction.IgnoreAndResume,
+            labelScanAction("B\$HU03000001", sheet)
+        )
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(2, 3)),
+            labelScanAction("B\$HU03010210", sheet)
+        )
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 2)),
+            labelScanAction("B\$HU020041", sheet)
+        )
+
+        val jsonl = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"hi\"}"
+        val frames = encodeBbqr(
+            jsonl.toByteArray(StandardCharsets.UTF_8),
+            'H',
+            parts = 2
+        )
+        assertEquals(2, frames.size)
+        val importing = BbqrAccumulator()
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 2)),
+            scan(frames[0], importing)
+        )
+        assertEquals(
+            LabelScanAction.IgnoreAndResume,
+            scan(frames[0], importing)
+        )
+        assertEquals(
+            LabelScanAction.Import(jsonl, BbqrProgress(2, 2)),
+            scan(frames[1], importing)
+        )
     }
 
     @Test
@@ -323,7 +388,10 @@ class ImportLabelsScanBottomSheetTest {
             parts = 2
         )
         assertTrue(part.size > 1)
-        assertEquals(LabelScanAction.IgnoreAndResume, scan(part[0], session))
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, part.size)),
+            scan(part[0], session)
+        )
         assertEquals(
             LabelScanAction.Notify(BBQR_NOT_LABELS_MESSAGE),
             scan(part[1], session)
@@ -334,7 +402,10 @@ class ImportLabelsScanBottomSheetTest {
     @Test
     fun bqrPrefixDoesNotJoinABbqrSeries() {
         val session = BbqrAccumulator()
-        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$HU020041", session))
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 2)),
+            scan("B\$HU020041", session)
+        )
         assertEquals(LabelScanAction.IgnoreAndResume, scan("BQR:1/1/T/QUJD", session))
         assertEquals(LabelScanAction.IgnoreAndResume, scan("UR:BYTES/1-2/ABCDEF", session))
         // Part 1 completes only if the BQR: and UR frames did not reset the series.
@@ -347,10 +418,16 @@ class ImportLabelsScanBottomSheetTest {
     @Test
     fun aNewBbqrSeriesReplacesAnIncompleteOne() {
         val session = BbqrAccumulator()
-        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$HU020041", session))
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 2)),
+            scan("B\$HU020041", session)
+        )
         val text = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"hi\"}"
         val frame = encodeBbqr(text.toByteArray(StandardCharsets.UTF_8), 'H', parts = 1).single()
-        assertEquals(LabelScanAction.Import(text), scan(frame, session))
+        assertEquals(
+            LabelScanAction.Import(text, BbqrProgress(1, 1)),
+            scan(frame, session)
+        )
     }
 
     @Test
@@ -432,6 +509,7 @@ class ImportLabelsScanBottomSheetTest {
                     check(jsonl == null) { "BBQr series imported twice" }
                     jsonl = action.jsonl
                 }
+                is LabelScanAction.Collecting -> Unit
                 LabelScanAction.IgnoreAndResume -> Unit
                 is LabelScanAction.Notify -> error(action.message)
             }

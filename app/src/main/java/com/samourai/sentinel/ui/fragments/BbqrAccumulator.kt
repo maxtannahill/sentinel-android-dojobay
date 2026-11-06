@@ -58,9 +58,21 @@ sealed class BbqrFailure {
     data class FileType(val fileType: Char) : BbqrFailure()
 }
 
+/** Unique parts stored against the header's part count. Not a fountain estimate. */
+data class BbqrProgress(val collected: Int, val total: Int)
+
 sealed class BbqrReceive {
-    object Pending : BbqrReceive()
-    class Complete(val fileType: Char, val bytes: ByteArray) : BbqrReceive()
+    /**
+     * [storedNewPart] is true only when this frame was a part index the
+     * series did not already hold. A repeat of a stored body leaves the
+     * count where it is.
+     */
+    data class Pending(val progress: BbqrProgress, val storedNewPart: Boolean) : BbqrReceive()
+    class Complete(
+        val fileType: Char,
+        val bytes: ByteArray,
+        val progress: BbqrProgress
+    ) : BbqrReceive()
     data class Rejected(val failure: BbqrFailure) : BbqrReceive()
 }
 
@@ -89,11 +101,14 @@ class BbqrAccumulator {
     private val bodies = HashMap<Int, String>()
     private val parts = HashMap<Int, ByteArray>()
 
+    /** Parts currently held. [BbqrProgress.total] is 0 before the first frame. */
+    fun progress(): BbqrProgress = BbqrProgress(parts.size, partCount)
+
     fun receive(frame: String): BbqrReceive {
         val header = parseBbqrHeader(frame)
             ?: return BbqrReceive.Rejected(BbqrFailure.Decode)
         if (header.signature != signature) begin(header)
-        if (closed) return BbqrReceive.Pending
+        if (closed) return pending(storedNewPart = false)
         if (!isBbqrLabelText(header.fileType)) {
             closed = true
             return BbqrReceive.Rejected(BbqrFailure.FileType(header.fileType))
@@ -104,7 +119,7 @@ class BbqrAccumulator {
                 closed = true
                 return BbqrReceive.Rejected(BbqrFailure.Decode)
             }
-            return BbqrReceive.Pending
+            return pending(storedNewPart = false)
         }
         val decoded = decodeBody(header.encoding, header.body)
         if (decoded == null) {
@@ -113,7 +128,7 @@ class BbqrAccumulator {
         }
         bodies[header.partIndex] = header.body
         parts[header.partIndex] = decoded
-        if (parts.size < partCount) return BbqrReceive.Pending
+        if (parts.size < partCount) return pending(storedNewPart = true)
         val joined = joinParts()
         if (joined == null || joined.size > BBQR_MAX_DECODED_BYTES) {
             closed = true
@@ -128,8 +143,11 @@ class BbqrAccumulator {
             joined
         }
         closed = true
-        return BbqrReceive.Complete(fileType, raw)
+        return BbqrReceive.Complete(fileType, raw, progress())
     }
+
+    private fun pending(storedNewPart: Boolean): BbqrReceive.Pending =
+        BbqrReceive.Pending(progress(), storedNewPart)
 
     private fun begin(header: BbqrHeader) {
         signature = header.signature

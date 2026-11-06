@@ -14,10 +14,12 @@ import kotlin.math.roundToInt
  * on session start, stop, and UR complete. Lines carry counters only:
  * no frame bytes, payloads, labels, xpubs, or other user data.
  *
- * `accepted` is still the decoder's processedPartsCount (distinct fountain
- * parts by content hash, not recovered fragments). `newParts` /
- * `repeatParts` / `rejectedParts` are UR frames only. A decoded frame
- * that never entered the UR decoder is the remainder:
+ * `accepted` / `expected` are the latest transmission gauge. UR reports
+ * the decoder's processedPartsCount and expectedPartCount. BBQr label
+ * import reports unique parts stored and the header's part count, and
+ * only when a new index is stored. `newParts` / `repeatParts` /
+ * `rejectedParts` are UR frames only. A decoded frame that never entered
+ * the UR decoder is the remainder:
  * `decoded - newParts - repeatParts - rejectedParts`.
  * `width` / `height` / `rowStride` are sampled from the first YUV frame.
  */
@@ -107,8 +109,9 @@ object QrPerf {
     }
 
     /**
-     * Latest UR transmission gauge. [processedParts] is the decoder's
-     * accepted (non-duplicate) part count. Stores only; milestones log.
+     * Latest transmission gauge. UR passes the decoder's accepted
+     * (non-duplicate) part count. BBQr label import passes unique parts
+     * stored and the header part count. Stores only; milestones log.
      */
     fun noteTransmission(expectedParts: Int, processedParts: Int, progress: Double) {
         expected.set(expectedParts)

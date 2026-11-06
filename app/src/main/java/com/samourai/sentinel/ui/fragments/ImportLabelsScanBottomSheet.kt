@@ -32,8 +32,8 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         scanFragment.setPasteVisible(false)
-        // #71: counts only. processedPartsCount is the accepted (non-duplicate)
-        // part gauge the scanner already exposes. No progress UI change.
+        // UR parts still report the fountain gauge through this listener.
+        // BBQr parts report the header's exact count from the scan listener.
         scanFragment.setUrTransmissionListener { expected, processed, progress ->
             QrPerf.noteTransmission(expected, processed, progress)
         }
@@ -44,9 +44,14 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
             // never stopped) die with the upfront stop.
             when (val action = labelScanAction(payload, bbqrLabels)) {
                 is LabelScanAction.Import -> {
+                    action.bbqr?.let { noteBbqrProgress(it) }
                     onLabelsDecoded?.invoke(action.jsonl)
                     dismiss()
                     true
+                }
+                is LabelScanAction.Collecting -> {
+                    noteBbqrProgress(action.progress)
+                    false
                 }
                 is LabelScanAction.Notify -> {
                     Toast.makeText(context, action.message, Toast.LENGTH_SHORT).show()
@@ -59,6 +64,20 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
         childFragmentManager.beginTransaction()
             .replace(R.id.importLabelsScanContainer, scanFragment)
             .commit()
+    }
+
+    /**
+     * Exact collected/total. A repeat of a part already stored does not
+     * call this, so the ring and QRPerf stay put until a new index lands.
+     */
+    private fun noteBbqrProgress(progress: BbqrProgress) {
+        if (progress.total <= 0) return
+        scanFragment.showPartCount(progress.collected, progress.total)
+        QrPerf.noteTransmission(
+            progress.total,
+            progress.collected,
+            progress.collected.toDouble() / progress.total.toDouble()
+        )
     }
 
     private fun labelsFromUR(result: URDecoder.Result): String? {
@@ -115,7 +134,11 @@ fun classifyLabelQrPayload(payload: String): LabelQrPayload = when {
 }
 
 sealed class LabelScanAction {
-    data class Import(val jsonl: String) : LabelScanAction()
+    data class Import(
+        val jsonl: String,
+        val bbqr: BbqrProgress? = null
+    ) : LabelScanAction()
+    data class Collecting(val progress: BbqrProgress) : LabelScanAction()
     data class Notify(val message: String) : LabelScanAction()
     object IgnoreAndResume : LabelScanAction()
 }
@@ -124,12 +147,17 @@ fun labelScanAction(payload: String, bbqr: BbqrAccumulator): LabelScanAction =
     when (val classified = classifyLabelQrPayload(payload)) {
         is LabelQrPayload.Labels -> LabelScanAction.Import(classified.jsonl)
         LabelQrPayload.BbqrFrame -> when (val received = bbqr.receive(payload)) {
-            BbqrReceive.Pending -> LabelScanAction.IgnoreAndResume
+            is BbqrReceive.Pending ->
+                if (received.storedNewPart) {
+                    LabelScanAction.Collecting(received.progress)
+                } else {
+                    LabelScanAction.IgnoreAndResume
+                }
             is BbqrReceive.Rejected -> LabelScanAction.Notify(bbqrRejectMessage(received))
             is BbqrReceive.Complete -> {
                 val text = String(received.bytes, StandardCharsets.UTF_8)
                 if (isBbqrLabelText(received.fileType) && isValidLabelsJsonl(text)) {
-                    LabelScanAction.Import(text)
+                    LabelScanAction.Import(text, received.progress)
                 } else if (!isBbqrLabelText(received.fileType)) {
                     LabelScanAction.Notify(bbqrFileTypeMessage(received.fileType))
                 } else {
