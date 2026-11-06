@@ -97,8 +97,30 @@ class ImportLabelsScanBottomSheetTest {
     @Test
     fun classifyRoutesUrAndBbqrFramesAwayFromDoorCheck() {
         assertEquals(LabelQrPayload.UrFrame, classifyLabelQrPayload("UR:BYTES/1-2/ABCDEF"))
-        assertEquals(LabelQrPayload.BbqrFrame, classifyLabelQrPayload("BQR:1/1/T/QUJD"))
+        // Sparrow label export: zlib + base32, file type U, 1 part, index 0.
+        assertEquals(LabelQrPayload.BbqrFrame, classifyLabelQrPayload("B\$ZU0100"))
         assertEquals(LabelQrPayload.Invalid, classifyLabelQrPayload("not json"))
+    }
+
+    @Test
+    fun classifyAcceptsSpecBbqrHeadersAndRejectsTheOldBqrPrefix() {
+        assertTrue(isBbqrFrame("B\$ZU0100"))
+        assertTrue(isBbqrFrame("B\$HP0300"))
+        assertTrue(isBbqrFrame("B\$HP0302ABCD"))
+        assertTrue(isBbqrFrame("B\$2U0A00"))
+        // File type is one base-36 character; digits are in that alphabet.
+        assertTrue(isBbqrFrame("B\$H10000"))
+        assertEquals(LabelQrPayload.BbqrFrame, classifyLabelQrPayload("B\$ZU0100HELLO"))
+
+        assertFalse(isBbqrFrame("BQR:1/1/T/QUJD"))
+        assertFalse(isBbqrFrame("BQR"))
+        assertFalse(isBbqrFrame("B\$"))
+        assertFalse(isBbqrFrame("B\$ZU010"))
+        assertFalse(isBbqrFrame("b\$ZU0100"))
+        assertFalse(isBbqrFrame("B\$zU0100"))
+        assertFalse(isBbqrFrame("B\$XU0100"))
+        assertEquals(LabelQrPayload.Invalid, classifyLabelQrPayload("BQR:1/1/T/QUJD"))
+        assertEquals(LabelQrPayload.Invalid, classifyLabelQrPayload("b\$ZU0100"))
     }
 
     @Test
@@ -118,12 +140,18 @@ class ImportLabelsScanBottomSheetTest {
         assertEquals(LabelScanAction.Import(text), labelScanAction(text))
         assertEquals(
             LabelScanAction.NotifyBbqrUnsupported,
-            labelScanAction("BQR:1/1/T/QUJD")
+            labelScanAction("B\$ZU0100")
         )
+        assertEquals(LabelScanAction.IgnoreAndResume, labelScanAction("BQR:1/1/T/QUJD"))
         assertEquals(
             LabelScanAction.IgnoreAndResume,
             labelScanAction("ur:BYTES/1-2/ABCDEF")
         )
         assertEquals(LabelScanAction.IgnoreAndResume, labelScanAction("not json"))
+    }
+
+    @Test
+    fun bbqrToastUsesTheSpecSpelling() {
+        assertEquals("BBQr label export not yet supported", BBQR_UNSUPPORTED_MESSAGE)
     }
 }
