@@ -142,8 +142,66 @@ class QrPerfAccountingTest {
         assertEquals(
             "session=2 event=frames attempts=913 decoded=128 accepted=63 " +
                 "expected=396 pct=9 elapsedMs=444468 newParts=63 repeatParts=50 " +
-                "rejectedParts=15 avgAnalyzeMs=12 width=1280 height=720 rowStride=1504",
+                "rejectedParts=15 avgAnalyzeMs=12 width=1280 height=720 rowStride=1504 " +
+                "bbqrMiss=0 bbqrMissIdx=- bbqrHeld=0 bbqrKeep=0 bbqrDecode=0 " +
+                "bbqrIndex=0 bbqrClosed=0 bbqrOther=0 bbqrDecodeIdx=-",
             line
+        )
+    }
+
+    @Test
+    fun fewMissingBbqrIndexesAreNamedAndALongGapIsACount() {
+        assertEquals("bbqrMiss=0 bbqrMissIdx=-", formatBbqrMissing(emptyList()))
+        assertEquals("bbqrMiss=1 bbqrMissIdx=70", formatBbqrMissing(listOf(70)))
+        assertEquals("bbqrMiss=3 bbqrMissIdx=0,2,70", formatBbqrMissing(listOf(70, 0, 2)))
+        assertEquals("bbqrMiss=70 bbqrMissIdx=*", formatBbqrMissing((0 until 70).toList()))
+        assertEquals("-", formatBbqrIndexList(emptyList()))
+        assertEquals("70", formatBbqrIndexList(listOf(70)))
+        assertEquals("*", formatBbqrIndexList((0 until 9).toList()))
+    }
+
+    @Test
+    fun logLineNamesTheLastMissingBbqrIndexAndTheSkipCounters() {
+        val line = qrPerfLogLine(
+            session = 4,
+            event = "stop",
+            attempts = 900,
+            decoded = 438,
+            accepted = 70,
+            expected = 71,
+            percent = 99,
+            elapsedMs = 150000,
+            newParts = 0,
+            repeatParts = 0,
+            rejectedParts = 0,
+            avgAnalyzeMs = 8,
+            width = 1280,
+            height = 720,
+            rowStride = 1504,
+            bbqrMissing = intArrayOf(70),
+            bbqrHeld = 360,
+            bbqrKeep = 2,
+            bbqrDecode = 5,
+            bbqrIndex = 1,
+            bbqrClosed = 0,
+            bbqrOther = 0,
+            bbqrDecodeIdx = intArrayOf(70)
+        )
+        assertEquals(
+            "session=4 event=stop attempts=900 decoded=438 accepted=70 " +
+                "expected=71 pct=99 elapsedMs=150000 newParts=0 repeatParts=0 " +
+                "rejectedParts=0 avgAnalyzeMs=8 width=1280 height=720 rowStride=1504 " +
+                "bbqrMiss=1 bbqrMissIdx=70 bbqrHeld=360 bbqrKeep=2 bbqrDecode=5 " +
+                "bbqrIndex=1 bbqrClosed=0 bbqrOther=0 bbqrDecodeIdx=70",
+            line
+        )
+        assertEquals(
+            "session=4 event=bbqrSkip reason=decode index=70",
+            qrPerfBbqrSkipLine(4, BbqrSkipReason.Decode, 70)
+        )
+        assertEquals(
+            "session=4 event=bbqrSkip reason=index index=80",
+            qrPerfBbqrSkipLine(4, BbqrSkipReason.Index, 80)
         )
     }
 }

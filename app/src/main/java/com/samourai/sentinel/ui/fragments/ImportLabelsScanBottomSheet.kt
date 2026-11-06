@@ -6,6 +6,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment
+import com.invertedx.hummingbird.BbqrSkipReason
 import com.invertedx.hummingbird.QrPerf
 import com.samourai.sentinel.R
 import com.sparrowwallet.hummingbird.URDecoder
@@ -17,6 +18,7 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
 
     private var onLabelsDecoded: ((String) -> Unit)? = null
     private val scanFragment = ScanPubKeyFragment()
+    private val bbqrLabels = BbqrAccumulator()
 
     fun setOnLabelsDecodedListener(callback: (String) -> Unit) {
         onLabelsDecoded = callback
@@ -31,8 +33,8 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         scanFragment.setPasteVisible(false)
-        // #71: counts only. processedPartsCount is the accepted (non-duplicate)
-        // part gauge the scanner already exposes. No progress UI change.
+        // UR parts still report the fountain gauge through this listener.
+        // BBQr parts report the header's exact count from the scan listener.
         scanFragment.setUrTransmissionListener { expected, processed, progress ->
             QrPerf.noteTransmission(expected, processed, progress)
         }
@@ -41,18 +43,26 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
             // dispatch stops the camera when a decode is consumed, so the
             // resumeScan() calls the unconsumed arms needed (the scanner
             // never stopped) die with the upfront stop.
-            when (val action = labelScanAction(payload)) {
+            when (val action = labelScanAction(payload, bbqrLabels)) {
                 is LabelScanAction.Import -> {
+                    action.bbqr?.let { noteBbqrProgress(it) }
+                    noteBbqrWatch()
                     onLabelsDecoded?.invoke(action.jsonl)
                     dismiss()
                     true
                 }
-                LabelScanAction.NotifyBbqrUnsupported -> {
-                    Toast.makeText(
-                        context,
-                        BBQR_UNSUPPORTED_MESSAGE,
-                        Toast.LENGTH_SHORT
-                    ).show()
+                is LabelScanAction.Collecting -> {
+                    noteBbqrProgress(action.progress)
+                    noteBbqrWatch()
+                    false
+                }
+                is LabelScanAction.Skipped -> {
+                    noteBbqrSkip(action)
+                    false
+                }
+                is LabelScanAction.Notify -> {
+                    noteBbqrWatch()
+                    Toast.makeText(context, action.message, Toast.LENGTH_SHORT).show()
                     false
                 }
                 LabelScanAction.IgnoreAndResume -> false
@@ -62,6 +72,38 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
         childFragmentManager.beginTransaction()
             .replace(R.id.importLabelsScanContainer, scanFragment)
             .commit()
+    }
+
+    /**
+     * Exact collected/total. A repeat of a part already stored does not
+     * call this, so the ring and QRPerf stay put until a new index lands.
+     */
+    private fun noteBbqrProgress(progress: BbqrProgress) {
+        if (progress.total <= 0) return
+        scanFragment.showPartCount(progress.collected, progress.total)
+        QrPerf.noteTransmission(
+            progress.total,
+            progress.collected,
+            progress.collected.toDouble() / progress.total.toDouble()
+        )
+    }
+
+    /** Missing indexes for the next QRPerf line. Does not move accepted/expected. */
+    private fun noteBbqrWatch() {
+        QrPerf.noteBbqrMissing(bbqrLabels.missingIndexes(), bbqrLabels.seriesId())
+    }
+
+    /**
+     * A skipped frame is counted, not toasted. A this-series body that
+     * fails to decode also notes that index once.
+     */
+    private fun noteBbqrSkip(action: LabelScanAction.Skipped) {
+        QrPerf.noteBbqrSkip(
+            bbqrSkipReason(action.reason),
+            action.partIndex,
+            oneShot = action.reason == BbqrSkip.Decode && action.thisSeries
+        )
+        noteBbqrWatch()
     }
 
     private fun labelsFromUR(result: URDecoder.Result): String? {
@@ -85,10 +127,11 @@ sealed class LabelQrPayload {
     object Invalid : LabelQrPayload()
 }
 
-/** Spec spelling is BBQr. Reassembly is #70; this scan only says so. */
-const val BBQR_UNSUPPORTED_MESSAGE = "BBQr label export not yet supported"
+const val BBQR_DECODE_FAILED_MESSAGE = "BBQr label export could not be decoded"
+const val BBQR_NOT_LABELS_MESSAGE = "BBQr payload is not a label export"
 
-private const val BBQR_HEADER_LENGTH = 8
+fun bbqrFileTypeMessage(fileType: Char): String =
+    "BBQr file type $fileType is not a label export"
 
 /**
  * Coinkite BBQr, not the old "BQR:" guess. The header is eight characters:
@@ -117,15 +160,61 @@ fun classifyLabelQrPayload(payload: String): LabelQrPayload = when {
 }
 
 sealed class LabelScanAction {
-    data class Import(val jsonl: String) : LabelScanAction()
-    object NotifyBbqrUnsupported : LabelScanAction()
+    data class Import(
+        val jsonl: String,
+        val bbqr: BbqrProgress? = null
+    ) : LabelScanAction()
+    data class Collecting(val progress: BbqrProgress) : LabelScanAction()
+    data class Skipped(
+        val reason: BbqrSkip,
+        val partIndex: Int? = null,
+        val thisSeries: Boolean = true,
+    ) : LabelScanAction()
+    data class Notify(val message: String) : LabelScanAction()
     object IgnoreAndResume : LabelScanAction()
 }
 
-fun labelScanAction(payload: String): LabelScanAction =
+fun labelScanAction(payload: String, bbqr: BbqrAccumulator): LabelScanAction =
     when (val classified = classifyLabelQrPayload(payload)) {
         is LabelQrPayload.Labels -> LabelScanAction.Import(classified.jsonl)
-        LabelQrPayload.BbqrFrame -> LabelScanAction.NotifyBbqrUnsupported
+        LabelQrPayload.BbqrFrame -> when (val received = bbqr.receive(payload)) {
+            is BbqrReceive.Pending ->
+                if (received.storedNewPart) {
+                    LabelScanAction.Collecting(received.progress)
+                } else {
+                    LabelScanAction.Skipped(
+                        reason = received.skip ?: BbqrSkip.Other,
+                        partIndex = received.partIndex,
+                        thisSeries = received.thisSeries,
+                    )
+                }
+            is BbqrReceive.Rejected -> LabelScanAction.Notify(bbqrRejectMessage(received))
+            is BbqrReceive.Complete -> {
+                val text = String(received.bytes, StandardCharsets.UTF_8)
+                if (isBbqrLabelText(received.fileType) && isValidLabelsJsonl(text)) {
+                    LabelScanAction.Import(text, received.progress)
+                } else if (!isBbqrLabelText(received.fileType)) {
+                    LabelScanAction.Notify(bbqrFileTypeMessage(received.fileType))
+                } else {
+                    LabelScanAction.Notify(BBQR_NOT_LABELS_MESSAGE)
+                }
+            }
+        }
         LabelQrPayload.UrFrame, LabelQrPayload.Invalid ->
             LabelScanAction.IgnoreAndResume
+    }
+
+private fun bbqrSkipReason(skip: BbqrSkip): BbqrSkipReason = when (skip) {
+    BbqrSkip.Held -> BbqrSkipReason.Held
+    BbqrSkip.Keep -> BbqrSkipReason.Keep
+    BbqrSkip.Decode -> BbqrSkipReason.Decode
+    BbqrSkip.Index -> BbqrSkipReason.Index
+    BbqrSkip.Closed -> BbqrSkipReason.Closed
+    BbqrSkip.Other -> BbqrSkipReason.Other
+}
+
+private fun bbqrRejectMessage(rejected: BbqrReceive.Rejected): String =
+    when (val failure = rejected.failure) {
+        BbqrFailure.Decode -> BBQR_DECODE_FAILED_MESSAGE
+        is BbqrFailure.FileType -> bbqrFileTypeMessage(failure.fileType)
     }

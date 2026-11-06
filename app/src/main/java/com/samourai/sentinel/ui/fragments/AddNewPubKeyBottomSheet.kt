@@ -564,6 +564,13 @@ class ScanPubKeyFragment : Fragment() {
         }
     }
 
+    /** Exact collected/total on the scanner's progress ring. BBQr label import. */
+    fun showPartCount(collected: Int, total: Int) {
+        if (::mCodeScanner.isInitialized) {
+            mCodeScanner.showPartCount(collected, total)
+        }
+    }
+
     fun resumeScan() {
         if (AndroidUtil.isPermissionGranted(Manifest.permission.CAMERA, appContext)) {
             // #232: guarded - startScanner() unbinds and rebinds even when

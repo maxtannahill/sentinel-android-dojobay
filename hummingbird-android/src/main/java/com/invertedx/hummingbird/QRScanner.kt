@@ -222,6 +222,22 @@ class QRScanner : FrameLayout, DefaultLifecycleObserver {
         this.invalidate()
     }
 
+    /**
+     * Same ring and caption the UR path uses, with an exact collected/total
+     * instead of the fountain percent. Callers pass a newly stored part;
+     * a repeat should not call this.
+     */
+    @SuppressLint("SetTextI18n")
+    fun showPartCount(collected: Int, total: Int) {
+        if (total <= 0) return
+        val shown = collected.coerceIn(0, total)
+        _progressIndicator?.visibility = View.VISIBLE
+        _progressIndicator?.max = total
+        _progressIndicator?.setProgressCompat(shown, false)
+        _progressMessage?.visibility = View.VISIBLE
+        _progressMessage?.text = "$shown/$total"
+    }
+
     fun setQRDecodeListener(callback: (result: String) -> Unit) {
         this._decodeQrCallback = callback
     }
