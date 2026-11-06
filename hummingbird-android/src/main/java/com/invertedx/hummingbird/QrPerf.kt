@@ -7,20 +7,48 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
 
 /**
+ * Why a BBQr frame was not stored. Logged as a counter name, never as
+ * frame bytes. [Held] is an index already stored with the same body.
+ * [Keep] is an index already stored whose new body disagrees; the first
+ * body stays. [Decode] is a body that does not decode. [Index] is past
+ * the header count. [Closed] is a finished series. [Other] is not a header.
+ */
+enum class BbqrSkipReason {
+    Held,
+    Keep,
+    Decode,
+    Index,
+    Closed,
+    Other;
+
+    internal fun logName(): String = when (this) {
+        Held -> "held"
+        Keep -> "keep"
+        Decode -> "decode"
+        Index -> "index"
+        Closed -> "closed"
+        Other -> "other"
+    }
+}
+
+/**
  * #71 measurement only. Counts and timings for `adb logcat -s QRPerf`.
  *
  * The analyze() path only increments integers and records how long the
  * frame took. A line is written every [FRAME_LOG_INTERVAL] entries and
- * on session start, stop, and UR complete. Lines carry counters only:
- * no frame bytes, payloads, labels, xpubs, or other user data.
+ * on session start, stop, and UR complete. Lines carry counters and
+ * BBQr part indexes only: no frame bytes, payloads, labels, xpubs, or
+ * other user data.
  *
  * `accepted` / `expected` are the latest transmission gauge. UR reports
  * the decoder's processedPartsCount and expectedPartCount. BBQr label
  * import reports unique parts stored and the header's part count, and
  * only when a new index is stored. `newParts` / `repeatParts` /
- * `rejectedParts` are UR frames only. A decoded frame that never entered
- * the UR decoder is the remainder:
- * `decoded - newParts - repeatParts - rejectedParts`.
+ * `rejectedParts` are UR frames only. BBQr skips use `bbqrHeld` /
+ * `bbqrKeep` / `bbqrDecode` / `bbqrIndex` / `bbqrClosed` / `bbqrOther`,
+ * and `bbqrMiss` / `bbqrMissIdx` name the indexes still missing when
+ * only a few remain. A decoded frame that never entered the UR decoder
+ * is the remainder: `decoded - newParts - repeatParts - rejectedParts`.
  * `width` / `height` / `rowStride` are sampled from the first YUV frame.
  */
 object QrPerf {
@@ -37,6 +65,12 @@ object QrPerf {
     private val newParts = AtomicInteger(0)
     private val repeatParts = AtomicInteger(0)
     private val rejectedParts = AtomicInteger(0)
+    private val bbqrHeld = AtomicInteger(0)
+    private val bbqrKeep = AtomicInteger(0)
+    private val bbqrDecode = AtomicInteger(0)
+    private val bbqrIndex = AtomicInteger(0)
+    private val bbqrClosed = AtomicInteger(0)
+    private val bbqrOther = AtomicInteger(0)
     private val analyzeTimeSumNs = AtomicLong(0)
     private val analyzeSamples = AtomicInteger(0)
 
@@ -49,6 +83,16 @@ object QrPerf {
     @Volatile
     private var geometry: FrameGeometry? = null
 
+    @Volatile
+    private var bbqrMissing = IntArray(0)
+
+    @Volatile
+    private var bbqrDecodeIdx = IntArray(0)
+
+    @Volatile
+    private var bbqrSeries = Int.MIN_VALUE
+    private val decodeNoted = HashSet<Int>()
+
     internal fun onSessionStart() {
         sessionId.incrementAndGet()
         attempts.set(0)
@@ -59,10 +103,22 @@ object QrPerf {
         newParts.set(0)
         repeatParts.set(0)
         rejectedParts.set(0)
+        bbqrHeld.set(0)
+        bbqrKeep.set(0)
+        bbqrDecode.set(0)
+        bbqrIndex.set(0)
+        bbqrClosed.set(0)
+        bbqrOther.set(0)
         analyzeTimeSumNs.set(0)
         analyzeSamples.set(0)
         geometry = null
         completeLogged = false
+        bbqrMissing = IntArray(0)
+        bbqrSeries = Int.MIN_VALUE
+        synchronized(decodeNoted) {
+            decodeNoted.clear()
+            bbqrDecodeIdx = IntArray(0)
+        }
         sessionStartElapsedMs = SystemClock.elapsedRealtime()
         log("start")
     }
@@ -119,6 +175,50 @@ object QrPerf {
         percent.set((progress * 100.0).roundToInt())
     }
 
+    /**
+     * Indexes still missing from the BBQr series in progress. A new
+     * [seriesGeneration] drops the decode-failure notes from the previous
+     * series. Stores only; milestones log.
+     */
+    fun noteBbqrMissing(indexes: Collection<Int>, seriesGeneration: Int) {
+        if (seriesGeneration != bbqrSeries) {
+            bbqrSeries = seriesGeneration
+            synchronized(decodeNoted) {
+                decodeNoted.clear()
+                bbqrDecodeIdx = IntArray(0)
+            }
+        }
+        bbqrMissing = indexes.toSortedSet().toIntArray()
+    }
+
+    /**
+     * One skipped BBQr frame. Counters stay until the next milestone.
+     * The first time a this-series index fails to decode, [oneShot]
+     * writes a single line with that index and no frame bytes.
+     */
+    fun noteBbqrSkip(reason: BbqrSkipReason, index: Int?, oneShot: Boolean) {
+        when (reason) {
+            BbqrSkipReason.Held -> bbqrHeld.incrementAndGet()
+            BbqrSkipReason.Keep -> bbqrKeep.incrementAndGet()
+            BbqrSkipReason.Decode -> bbqrDecode.incrementAndGet()
+            BbqrSkipReason.Index -> bbqrIndex.incrementAndGet()
+            BbqrSkipReason.Closed -> bbqrClosed.incrementAndGet()
+            BbqrSkipReason.Other -> bbqrOther.incrementAndGet()
+        }
+        if (reason != BbqrSkipReason.Decode || index == null || !oneShot) return
+        val first = synchronized(decodeNoted) {
+            if (!decodeNoted.add(index)) {
+                false
+            } else {
+                bbqrDecodeIdx = decodeNoted.toIntArray()
+                true
+            }
+        }
+        if (first) {
+            Log.i(TAG, qrPerfBbqrSkipLine(sessionId.get(), reason, index))
+        }
+    }
+
     internal fun logPeriodic() {
         log("frames")
     }
@@ -153,7 +253,15 @@ object QrPerf {
                 avgAnalyzeMs = averageAnalyzeMs(analyzeTimeSumNs.get(), analyzeSamples.get()),
                 width = frame?.width ?: 0,
                 height = frame?.height ?: 0,
-                rowStride = frame?.rowStride ?: 0
+                rowStride = frame?.rowStride ?: 0,
+                bbqrMissing = bbqrMissing,
+                bbqrHeld = bbqrHeld.get(),
+                bbqrKeep = bbqrKeep.get(),
+                bbqrDecode = bbqrDecode.get(),
+                bbqrIndex = bbqrIndex.get(),
+                bbqrClosed = bbqrClosed.get(),
+                bbqrOther = bbqrOther.get(),
+                bbqrDecodeIdx = bbqrDecodeIdx
             )
         )
     }

@@ -61,13 +61,38 @@ sealed class BbqrFailure {
 /** Unique parts stored against the header's part count. Not a fountain estimate. */
 data class BbqrProgress(val collected: Int, val total: Int)
 
+/**
+ * Why a BBQr frame was not stored. Collection stays open either way.
+ * [Held] and [Keep] are an index already stored (same body, or a later
+ * disagreement that keeps the first body). [Decode] is a body that does
+ * not decode. [Index] is an index past the header count, or a count of
+ * zero. [Closed] is a frame for a series that already finished. [Other]
+ * is not a BBQr header.
+ */
+enum class BbqrSkip {
+    Held,
+    Keep,
+    Decode,
+    Index,
+    Closed,
+    Other,
+}
+
 sealed class BbqrReceive {
     /**
      * [storedNewPart] is true only when this frame was a part index the
-     * series did not already hold. A repeat of a stored body leaves the
-     * count where it is.
+     * series did not already hold. A skip leaves the count where it is
+     * and names [skip]. [partIndex] is the header's index when the frame
+     * had one. [thisSeries] is false when the frame's six-character
+     * signature is not the series being collected.
      */
-    data class Pending(val progress: BbqrProgress, val storedNewPart: Boolean) : BbqrReceive()
+    data class Pending(
+        val progress: BbqrProgress,
+        val storedNewPart: Boolean,
+        val skip: BbqrSkip? = null,
+        val partIndex: Int? = null,
+        val thisSeries: Boolean = true,
+    ) : BbqrReceive()
     class Complete(
         val fileType: Char,
         val bytes: ByteArray,
@@ -102,23 +127,52 @@ class BbqrAccumulator {
     private var fileType: Char = 'U'
     private var partCount: Int = 0
     private var closed: Boolean = false
+    private var seriesId: Int = 0
     private val bodies = HashMap<Int, String>()
     private val parts = HashMap<Int, ByteArray>()
 
     /** Parts currently held. [BbqrProgress.total] is 0 before the first frame. */
     fun progress(): BbqrProgress = BbqrProgress(parts.size, partCount)
 
+    /** Indexes in `0 until partCount` that are not stored yet, ascending. */
+    fun missingIndexes(): List<Int> {
+        if (partCount <= 0) return emptyList()
+        val missing = ArrayList<Int>(partCount - parts.size)
+        for (index in 0 until partCount) {
+            if (!parts.containsKey(index)) missing.add(index)
+        }
+        return missing
+    }
+
+    /** Bumps when a new six-character signature replaces the series. */
+    fun seriesId(): Int = seriesId
+
     fun receive(frame: String): BbqrReceive {
-        val header = parseBbqrHeader(frame) ?: return skipped()
+        val header = parseBbqrHeader(frame)
+        if (header == null) {
+            val raw = rawCounts(frame)
+            return if (raw != null && (raw.count <= 0 || raw.index >= raw.count)) {
+                skipped(BbqrSkip.Index, raw.index, raw.signature == signature)
+            } else {
+                skipped(BbqrSkip.Other, null, thisSeries = false)
+            }
+        }
         val switching = header.signature != signature
-        if (!switching && closed) return skipped()
+        if (!switching && closed) return skipped(BbqrSkip.Closed, header.partIndex)
         if (!isBbqrLabelText(header.fileType)) {
             begin(header)
             closed = true
             return BbqrReceive.Rejected(BbqrFailure.FileType(header.fileType))
         }
-        if (!switching && bodies[header.partIndex] != null) return skipped()
-        val decoded = decodeBody(header.encoding, header.body) ?: return skipped()
+        if (!switching) {
+            val previous = bodies[header.partIndex]
+            if (previous != null) {
+                val reason = if (previous == header.body) BbqrSkip.Held else BbqrSkip.Keep
+                return skipped(reason, header.partIndex)
+            }
+        }
+        val decoded = decodeBody(header.encoding, header.body)
+            ?: return skipped(BbqrSkip.Decode, header.partIndex, thisSeries = !switching)
         if (switching) begin(header)
         bodies[header.partIndex] = header.body
         parts[header.partIndex] = decoded
@@ -141,12 +195,23 @@ class BbqrAccumulator {
     }
 
     /** Not stored. Progress stays where it is, and the series stays open. */
-    private fun skipped(): BbqrReceive.Pending = pending(storedNewPart = false)
+    private fun skipped(
+        reason: BbqrSkip,
+        index: Int?,
+        thisSeries: Boolean = true,
+    ): BbqrReceive.Pending = BbqrReceive.Pending(
+        progress(),
+        storedNewPart = false,
+        skip = reason,
+        partIndex = index,
+        thisSeries = thisSeries,
+    )
 
     private fun pending(storedNewPart: Boolean): BbqrReceive.Pending =
         BbqrReceive.Pending(progress(), storedNewPart)
 
     private fun begin(header: BbqrHeader) {
+        seriesId += 1
         signature = header.signature
         encoding = header.encoding
         fileType = header.fileType
@@ -164,6 +229,18 @@ class BbqrAccumulator {
         }
         return out.toByteArray()
     }
+}
+
+private data class RawBbqrCount(val signature: String, val count: Int, val index: Int)
+
+/** Header digits even when the index cannot address a part. Null when [frame] is not BBQr. */
+private fun rawCounts(frame: String): RawBbqrCount? {
+    if (!isBbqrFrame(frame)) return null
+    return RawBbqrCount(
+        signature = frame.substring(0, 6),
+        count = frame.substring(4, 6).toInt(36),
+        index = frame.substring(6, 8).toInt(36),
+    )
 }
 
 private fun decodeBody(encoding: Char, body: String): ByteArray? = when (encoding) {

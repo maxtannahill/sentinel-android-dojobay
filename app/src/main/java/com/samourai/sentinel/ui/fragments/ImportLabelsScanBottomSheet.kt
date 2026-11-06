@@ -6,6 +6,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment
+import com.invertedx.hummingbird.BbqrSkipReason
 import com.invertedx.hummingbird.QrPerf
 import com.samourai.sentinel.R
 import com.sparrowwallet.hummingbird.URDecoder
@@ -45,15 +46,22 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
             when (val action = labelScanAction(payload, bbqrLabels)) {
                 is LabelScanAction.Import -> {
                     action.bbqr?.let { noteBbqrProgress(it) }
+                    noteBbqrWatch()
                     onLabelsDecoded?.invoke(action.jsonl)
                     dismiss()
                     true
                 }
                 is LabelScanAction.Collecting -> {
                     noteBbqrProgress(action.progress)
+                    noteBbqrWatch()
+                    false
+                }
+                is LabelScanAction.Skipped -> {
+                    noteBbqrSkip(action)
                     false
                 }
                 is LabelScanAction.Notify -> {
+                    noteBbqrWatch()
                     Toast.makeText(context, action.message, Toast.LENGTH_SHORT).show()
                     false
                 }
@@ -78,6 +86,24 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
             progress.collected,
             progress.collected.toDouble() / progress.total.toDouble()
         )
+    }
+
+    /** Missing indexes for the next QRPerf line. Does not move accepted/expected. */
+    private fun noteBbqrWatch() {
+        QrPerf.noteBbqrMissing(bbqrLabels.missingIndexes(), bbqrLabels.seriesId())
+    }
+
+    /**
+     * A skipped frame is counted, not toasted. A this-series body that
+     * fails to decode also notes that index once.
+     */
+    private fun noteBbqrSkip(action: LabelScanAction.Skipped) {
+        QrPerf.noteBbqrSkip(
+            bbqrSkipReason(action.reason),
+            action.partIndex,
+            oneShot = action.reason == BbqrSkip.Decode && action.thisSeries
+        )
+        noteBbqrWatch()
     }
 
     private fun labelsFromUR(result: URDecoder.Result): String? {
@@ -139,6 +165,11 @@ sealed class LabelScanAction {
         val bbqr: BbqrProgress? = null
     ) : LabelScanAction()
     data class Collecting(val progress: BbqrProgress) : LabelScanAction()
+    data class Skipped(
+        val reason: BbqrSkip,
+        val partIndex: Int? = null,
+        val thisSeries: Boolean = true,
+    ) : LabelScanAction()
     data class Notify(val message: String) : LabelScanAction()
     object IgnoreAndResume : LabelScanAction()
 }
@@ -151,7 +182,11 @@ fun labelScanAction(payload: String, bbqr: BbqrAccumulator): LabelScanAction =
                 if (received.storedNewPart) {
                     LabelScanAction.Collecting(received.progress)
                 } else {
-                    LabelScanAction.IgnoreAndResume
+                    LabelScanAction.Skipped(
+                        reason = received.skip ?: BbqrSkip.Other,
+                        partIndex = received.partIndex,
+                        thisSeries = received.thisSeries,
+                    )
                 }
             is BbqrReceive.Rejected -> LabelScanAction.Notify(bbqrRejectMessage(received))
             is BbqrReceive.Complete -> {
@@ -168,6 +203,15 @@ fun labelScanAction(payload: String, bbqr: BbqrAccumulator): LabelScanAction =
         LabelQrPayload.UrFrame, LabelQrPayload.Invalid ->
             LabelScanAction.IgnoreAndResume
     }
+
+private fun bbqrSkipReason(skip: BbqrSkip): BbqrSkipReason = when (skip) {
+    BbqrSkip.Held -> BbqrSkipReason.Held
+    BbqrSkip.Keep -> BbqrSkipReason.Keep
+    BbqrSkip.Decode -> BbqrSkipReason.Decode
+    BbqrSkip.Index -> BbqrSkipReason.Index
+    BbqrSkip.Closed -> BbqrSkipReason.Closed
+    BbqrSkip.Other -> BbqrSkipReason.Other
+}
 
 private fun bbqrRejectMessage(rejected: BbqrReceive.Rejected): String =
     when (val failure = rejected.failure) {

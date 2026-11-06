@@ -212,10 +212,19 @@ class ImportLabelsScanBottomSheetTest {
         // An index past the header count is skipped. It does not toast
         // and it does not wipe the parts already stored.
         assertEquals(
-            BbqrReceive.Pending(BbqrProgress(2, 3), storedNewPart = false),
+            BbqrReceive.Pending(
+                BbqrProgress(2, 3),
+                storedNewPart = false,
+                skip = BbqrSkip.Index,
+                partIndex = 5,
+            ),
             session.receive("B\$HU0305FFFF")
         )
-        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$HU0305FFFF", session))
+        assertEquals(listOf(1), session.missingIndexes())
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Index, partIndex = 5),
+            scan("B\$HU0305FFFF", session)
+        )
         val done = session.receive(frames[1])
         assertTrue(done is BbqrReceive.Complete)
         assertArrayEquals(raw, (done as BbqrReceive.Complete).bytes)
@@ -236,13 +245,20 @@ class ImportLabelsScanBottomSheetTest {
             session.receive("B\$HU03000001")
         )
         assertEquals(
-            BbqrReceive.Pending(BbqrProgress(1, 3), storedNewPart = false),
+            BbqrReceive.Pending(
+                BbqrProgress(1, 3),
+                storedNewPart = false,
+                skip = BbqrSkip.Held,
+                partIndex = 0,
+            ),
             session.receive("B\$HU03000001")
         )
+        assertEquals(listOf(1, 2), session.missingIndexes())
         assertEquals(
             BbqrReceive.Pending(BbqrProgress(2, 3), storedNewPart = true),
             session.receive("B\$HU03027FFF")
         )
+        assertEquals(listOf(1), session.missingIndexes())
         // First six characters differ (B$HU03 vs B$HU02): the count restarts.
         assertEquals(
             BbqrReceive.Pending(BbqrProgress(1, 2), storedNewPart = true),
@@ -256,7 +272,7 @@ class ImportLabelsScanBottomSheetTest {
             labelScanAction("B\$HU03000001", sheet)
         )
         assertEquals(
-            LabelScanAction.IgnoreAndResume,
+            LabelScanAction.Skipped(BbqrSkip.Held, partIndex = 0),
             labelScanAction("B\$HU03000001", sheet)
         )
         assertEquals(
@@ -280,8 +296,9 @@ class ImportLabelsScanBottomSheetTest {
             LabelScanAction.Collecting(BbqrProgress(1, 2)),
             scan(frames[0], importing)
         )
+        assertEquals(listOf(1), importing.missingIndexes())
         assertEquals(
-            LabelScanAction.IgnoreAndResume,
+            LabelScanAction.Skipped(BbqrSkip.Held, partIndex = 0),
             scan(frames[0], importing)
         )
         assertEquals(
@@ -298,10 +315,19 @@ class ImportLabelsScanBottomSheetTest {
             session.receive("B\$HU02000001")
         )
         assertEquals(
-            BbqrReceive.Pending(BbqrProgress(1, 2), storedNewPart = false),
+            BbqrReceive.Pending(
+                BbqrProgress(1, 2),
+                storedNewPart = false,
+                skip = BbqrSkip.Keep,
+                partIndex = 0,
+            ),
             session.receive("B\$HU020000FF")
         )
-        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$HU020000FF", session))
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Keep, partIndex = 0),
+            scan("B\$HU020000FF", session)
+        )
+        assertEquals(listOf(1), session.missingIndexes())
         assertEquals(BbqrProgress(1, 2), session.progress())
         val done = session.receive("B\$HU0201FFFF")
         assertTrue(done is BbqrReceive.Complete)
@@ -310,15 +336,26 @@ class ImportLabelsScanBottomSheetTest {
             (done as BbqrReceive.Complete).bytes
         )
         assertEquals(
-            BbqrReceive.Pending(BbqrProgress(2, 2), storedNewPart = false),
+            BbqrReceive.Pending(
+                BbqrProgress(2, 2),
+                storedNewPart = false,
+                skip = BbqrSkip.Closed,
+                partIndex = 1,
+            ),
             session.receive("B\$HU0201FFFF")
         )
     }
 
     @Test
     fun garbledFrameIsSkippedAndALaterPartCanComplete() {
-        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$HU02000G"))
-        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$HU0305FFFF"))
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Decode, partIndex = 0, thisSeries = false),
+            scan("B\$HU02000G")
+        )
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Index, partIndex = 5, thisSeries = false),
+            scan("B\$HU0305FFFF")
+        )
 
         val jsonl = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"hi\"}"
         val frames = encodeBbqr(
@@ -333,29 +370,50 @@ class ImportLabelsScanBottomSheetTest {
             scan(frames[0], session)
         )
 
+        assertEquals(listOf(1), session.missingIndexes())
         val badNewPart = frames[1].take(BBQR_HEADER_LENGTH) + "0G"
-        assertEquals(LabelScanAction.IgnoreAndResume, scan(badNewPart, session))
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Decode, partIndex = 1),
+            scan(badNewPart, session)
+        )
         assertEquals(BbqrProgress(1, 2), session.progress())
+        assertEquals(listOf(1), session.missingIndexes())
 
         val unaddressable = frames[0].take(6) + "05FFFF"
-        assertEquals(LabelScanAction.IgnoreAndResume, scan(unaddressable, session))
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Index, partIndex = 5),
+            scan(unaddressable, session)
+        )
         assertEquals(BbqrProgress(1, 2), session.progress())
 
         val conflict = frames[0].take(BBQR_HEADER_LENGTH) + "00"
         assertFalse(conflict == frames[0])
-        assertEquals(LabelScanAction.IgnoreAndResume, scan(conflict, session))
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Keep, partIndex = 0),
+            scan(conflict, session)
+        )
         assertEquals(BbqrProgress(1, 2), session.progress())
 
         // Undecodable body, different six-character signature: the series in progress stays.
-        assertEquals(LabelScanAction.IgnoreAndResume, scan("B\$2U0300A", session))
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Decode, partIndex = 0, thisSeries = false),
+            scan("B\$2U0300A", session)
+        )
         assertEquals(BbqrProgress(1, 2), session.progress())
+        assertEquals(listOf(1), session.missingIndexes())
 
         assertEquals(
             LabelScanAction.Import(jsonl, BbqrProgress(2, 2)),
             scan(frames[1], session)
         )
-        assertEquals(LabelScanAction.IgnoreAndResume, scan(frames[1], session))
-        assertEquals(LabelScanAction.IgnoreAndResume, scan(frames[0], session))
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Closed, partIndex = 1),
+            scan(frames[1], session)
+        )
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Closed, partIndex = 0),
+            scan(frames[0], session)
+        )
     }
 
     @Test
@@ -456,7 +514,10 @@ class ImportLabelsScanBottomSheetTest {
             LabelScanAction.Notify(BBQR_NOT_LABELS_MESSAGE),
             scan(part[1], session)
         )
-        assertEquals(LabelScanAction.IgnoreAndResume, scan(part[1], session))
+        assertEquals(
+            LabelScanAction.Skipped(BbqrSkip.Closed, partIndex = part.lastIndex),
+            scan(part[1], session)
+        )
     }
 
     @Test
@@ -505,7 +566,7 @@ class ImportLabelsScanBottomSheetTest {
                 scan("B\$H${type}0200AA", session)
             )
             assertEquals(
-                LabelScanAction.IgnoreAndResume,
+                LabelScanAction.Skipped(BbqrSkip.Closed, partIndex = 1),
                 scan("B\$H${type}0201BB", session)
             )
         }
@@ -570,13 +631,14 @@ class ImportLabelsScanBottomSheetTest {
                     jsonl = action.jsonl
                 }
                 is LabelScanAction.Collecting -> Unit
+                is LabelScanAction.Skipped -> Unit
                 LabelScanAction.IgnoreAndResume -> Unit
                 is LabelScanAction.Notify -> error(action.message)
             }
         }
         if (frames.size == 1) {
             assertEquals(
-                LabelScanAction.IgnoreAndResume,
+                LabelScanAction.Skipped(BbqrSkip.Closed, partIndex = 0),
                 labelScanAction(frames[0], session)
             )
         }
