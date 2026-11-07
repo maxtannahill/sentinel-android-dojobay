@@ -296,8 +296,8 @@ The PIN is 5–8 digits (AccessFactory). Lock timeout is 15 min. No wrong-attemp
 | SET-07 | Import Dojo over Tor retry | Tor just started | Import with Dojo | "Waiting for Tor circuit… (attempt x of 3)". Then success or a clear failure | P1 | E | |
 | SET-08 | Restore from the first-run menu | Fresh install | ⋮ Restore | Opens the import | P2 | M | |
 | SET-09 | Export BIP-329 labels | Labels exist | Export Labels | Valid JSONL file | P2 | E | |
-| SET-10 | Import BIP-329 labels (file) | JSONL from Sparrow | Import Labels | Labels appear on txs/UTXOs | P2 | E | |
-| SET-11 | Import labels by QR | Label QR | Import Labels (QR) | Same as SET-10 | P2 | E | |
+| SET-10 | Import BIP-329 labels (file) | JSONL from Sparrow or Ashigaru Desktop | Import Labels | Labels appear on txs/UTXOs | P2 | E | |
+| SET-11 | Import labels by QR | BIP-329 animated UR or BBQr | Import Labels (QR) | Same as SET-10 | P2 | E | |
 | SET-12 | Explorer selection | Settings → Explorer | Switch, then open a tx | Opens the chosen explorer | P2 | M | |
 | SET-13 | Erase all data | Data | Erase all Sentinel data → PIN → confirm | Back to first run. No keys, Dojo, PIN left | P0 | M | |
 | SET-14 | Share error log | After a crash | Share error log | Shares the log. Contains no secrets (see SEC-04) | P1 | E | |
