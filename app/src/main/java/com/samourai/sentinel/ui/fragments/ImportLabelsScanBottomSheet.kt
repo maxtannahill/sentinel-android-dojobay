@@ -1,16 +1,27 @@
 package com.samourai.sentinel.ui.fragments
 
+import android.app.Dialog
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
+import androidx.lifecycle.lifecycleScope
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.invertedx.hummingbird.BbqrSkipReason
 import com.invertedx.hummingbird.QrPerf
 import com.samourai.sentinel.R
 import com.sparrowwallet.hummingbird.URDecoder
 import com.sparrowwallet.hummingbird.registry.RegistryType
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.nio.charset.StandardCharsets
 
@@ -19,6 +30,10 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
     private var onLabelsDecoded: ((String) -> Unit)? = null
     private val scanFragment = ScanPubKeyFragment()
     private val bbqrLabels = BbqrAccumulator()
+    private val bbqrGate = Mutex()
+    private var bbqrGeneration = 0
+    private var importConsumed = false
+    private var conflictDialog: Dialog? = null
 
     fun setOnLabelsDecodedListener(callback: (String) -> Unit) {
         onLabelsDecoded = callback
@@ -39,34 +54,30 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
             QrPerf.noteTransmission(expected, processed, progress)
         }
         scanFragment.setOnScanListener { payload ->
-            // #232: same pure action logic, new contract - the scanner's
-            // dispatch stops the camera when a decode is consumed, so the
-            // resumeScan() calls the unconsumed arms needed (the scanner
-            // never stopped) die with the upfront stop.
-            when (val action = labelScanAction(payload, bbqrLabels)) {
-                is LabelScanAction.Import -> {
-                    action.bbqr?.let { noteBbqrProgress(it) }
-                    noteBbqrWatch()
-                    onLabelsDecoded?.invoke(action.jsonl)
-                    dismiss()
-                    true
+            // Join, inflate, and the label check run off this callback.
+            // The callback itself stays on the camera main thread, so it
+            // only schedules the work and keeps the camera running until
+            // an import actually consumes the scan.
+            val generation = bbqrGeneration
+            viewLifecycleOwner.lifecycleScope.launch {
+                val action = try {
+                    bbqrGate.withLock {
+                        if (generation != bbqrGeneration || importConsumed) return@withLock null
+                        val action = runLabelFrame(payload, bbqrLabels) {
+                            this@launch.isActive && generation == bbqrGeneration
+                        }
+                        if (generation != bbqrGeneration) return@withLock null
+                        if (action is LabelScanAction.Import) importConsumed = true
+                        action
+                    }
+                } catch (abandoned: BbqrAbandoned) {
+                    if (!isActive) throw CancellationException("BBQr")
+                    null
                 }
-                is LabelScanAction.Collecting -> {
-                    noteBbqrProgress(action.progress)
-                    noteBbqrWatch()
-                    false
-                }
-                is LabelScanAction.Skipped -> {
-                    noteBbqrSkip(action)
-                    false
-                }
-                is LabelScanAction.Notify -> {
-                    noteBbqrWatch()
-                    Toast.makeText(context, action.message, Toast.LENGTH_SHORT).show()
-                    false
-                }
-                LabelScanAction.IgnoreAndResume -> false
+                if (action == null || !isActive || generation != bbqrGeneration) return@launch
+                applyLabelScan(action)
             }
+            false
         }
         scanFragment.setURPayloadDecoder(::labelsFromUR)
         childFragmentManager.beginTransaction()
@@ -106,6 +117,80 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
         noteBbqrWatch()
     }
 
+    override fun onDestroyView() {
+        conflictDialog?.dismiss()
+        conflictDialog = null
+        super.onDestroyView()
+    }
+
+    /**
+     * UI for one [labelScanAction] result. Runs on the main thread after
+     * the worker has finished, and only for the generation that started
+     * the work.
+     */
+    private fun applyLabelScan(action: LabelScanAction) {
+        if (!isAdded) return
+        when (action) {
+            is LabelScanAction.Import -> {
+                action.bbqr?.let { noteBbqrProgress(it) }
+                noteBbqrWatch()
+                scanFragment.stopScanner()
+                onLabelsDecoded?.invoke(action.jsonl)
+                dismiss()
+            }
+            is LabelScanAction.Collecting -> {
+                noteBbqrProgress(action.progress)
+                noteBbqrWatch()
+            }
+            is LabelScanAction.Skipped -> noteBbqrSkip(action)
+            is LabelScanAction.Notify -> {
+                noteBbqrWatch()
+                val ctx = context ?: return
+                Toast.makeText(ctx, action.message, Toast.LENGTH_SHORT).show()
+            }
+            is LabelScanAction.Restart -> {
+                noteBbqrSkip(
+                    LabelScanAction.Skipped(
+                        reason = BbqrSkip.Conflict,
+                        partIndex = action.partIndex,
+                    )
+                )
+                noteBbqrProgress(bbqrLabels.progress())
+                noteBbqrWatch()
+                showConflictDialog()
+            }
+            LabelScanAction.IgnoreAndResume -> Unit
+        }
+    }
+
+    private fun showConflictDialog() {
+        if (conflictDialog?.isShowing == true) return
+        val ctx = context ?: return
+        conflictDialog = MaterialAlertDialogBuilder(ctx)
+            .setMessage(BBQR_CONFLICT_MESSAGE)
+            .setPositiveButton(BBQR_START_OVER) { dialog, _ ->
+                restartBbqrScan()
+                dialog.dismiss()
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    /** Drops the mixed series so the same export can be scanned again. */
+    private fun restartBbqrScan() {
+        bbqrGeneration += 1
+        conflictDialog?.dismiss()
+        conflictDialog = null
+        val owner = viewLifecycleOwnerLiveData.value ?: return
+        owner.lifecycleScope.launch {
+            bbqrGate.withLock {
+                bbqrLabels.reset()
+            }
+            QrPerf.noteBbqrMissing(emptyList(), bbqrLabels.seriesId())
+            scanFragment.clearPartCount()
+        }
+    }
+
     private fun labelsFromUR(result: URDecoder.Result): String? {
         if (result.ur.registryType != RegistryType.BYTES) return null
         val text = runCatching {
@@ -129,6 +214,8 @@ sealed class LabelQrPayload {
 
 const val BBQR_DECODE_FAILED_MESSAGE = "BBQr label export could not be decoded"
 const val BBQR_NOT_LABELS_MESSAGE = "BBQr payload is not a label export"
+const val BBQR_CONFLICT_MESSAGE = "BBQr parts disagree. Start the scan over."
+const val BBQR_START_OVER = "Start over"
 
 fun bbqrFileTypeMessage(fileType: Char): String =
     "BBQr file type $fileType is not a label export"
@@ -171,13 +258,33 @@ sealed class LabelScanAction {
         val thisSeries: Boolean = true,
     ) : LabelScanAction()
     data class Notify(val message: String) : LabelScanAction()
+    data class Restart(val message: String, val partIndex: Int) : LabelScanAction()
     object IgnoreAndResume : LabelScanAction()
 }
 
-fun labelScanAction(payload: String, bbqr: BbqrAccumulator): LabelScanAction =
-    when (val classified = classifyLabelQrPayload(payload)) {
+/**
+ * Join, inflate, and the JSONL door-check. [worker] is the camera
+ * callback's escape: the sheet runs this off the main thread and passes
+ * an [isActive] that goes false on dismiss or [BbqrAccumulator.reset].
+ */
+internal suspend fun runLabelFrame(
+    payload: String,
+    bbqr: BbqrAccumulator,
+    worker: CoroutineDispatcher = Dispatchers.Default,
+    isActive: () -> Boolean = { true },
+): LabelScanAction = withContext(worker) {
+    labelScanAction(payload, bbqr, isActive)
+}
+
+fun labelScanAction(
+    payload: String,
+    bbqr: BbqrAccumulator,
+    isActive: () -> Boolean = { true },
+): LabelScanAction {
+    if (!isActive()) throw BbqrAbandoned()
+    return when (val classified = classifyLabelQrPayload(payload)) {
         is LabelQrPayload.Labels -> LabelScanAction.Import(classified.jsonl)
-        LabelQrPayload.BbqrFrame -> when (val received = bbqr.receive(payload)) {
+        LabelQrPayload.BbqrFrame -> when (val received = bbqr.receive(payload, isActive)) {
             is BbqrReceive.Pending ->
                 if (received.storedNewPart) {
                     LabelScanAction.Collecting(received.progress)
@@ -188,8 +295,11 @@ fun labelScanAction(payload: String, bbqr: BbqrAccumulator): LabelScanAction =
                         thisSeries = received.thisSeries,
                     )
                 }
+            is BbqrReceive.Conflict ->
+                LabelScanAction.Restart(BBQR_CONFLICT_MESSAGE, received.partIndex)
             is BbqrReceive.Rejected -> LabelScanAction.Notify(bbqrRejectMessage(received))
             is BbqrReceive.Complete -> {
+                if (!isActive()) throw BbqrAbandoned()
                 val text = String(received.bytes, StandardCharsets.UTF_8)
                 if (isBbqrLabelText(received.fileType) && isValidLabelsJsonl(text)) {
                     LabelScanAction.Import(text, received.progress)
@@ -203,10 +313,11 @@ fun labelScanAction(payload: String, bbqr: BbqrAccumulator): LabelScanAction =
         LabelQrPayload.UrFrame, LabelQrPayload.Invalid ->
             LabelScanAction.IgnoreAndResume
     }
+}
 
 private fun bbqrSkipReason(skip: BbqrSkip): BbqrSkipReason = when (skip) {
     BbqrSkip.Held -> BbqrSkipReason.Held
-    BbqrSkip.Keep -> BbqrSkipReason.Keep
+    BbqrSkip.Conflict -> BbqrSkipReason.Conflict
     BbqrSkip.Decode -> BbqrSkipReason.Decode
     BbqrSkip.Index -> BbqrSkipReason.Index
     BbqrSkip.Closed -> BbqrSkipReason.Closed

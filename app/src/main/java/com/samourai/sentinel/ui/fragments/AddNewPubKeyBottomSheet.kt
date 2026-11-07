@@ -571,6 +571,20 @@ class ScanPubKeyFragment : Fragment() {
         }
     }
 
+    /** Hides the part ring. BBQr label import calls this from Start over. */
+    fun clearPartCount() {
+        if (::mCodeScanner.isInitialized) {
+            mCodeScanner.clearPartCount()
+        }
+    }
+
+    /** Stops the camera once a label import has consumed the scan. */
+    fun stopScanner() {
+        if (::mCodeScanner.isInitialized && mCodeScanner.isScannerRunning()) {
+            mCodeScanner.stopScanner()
+        }
+    }
+
     fun resumeScan() {
         if (AndroidUtil.isPermissionGranted(Manifest.permission.CAMERA, appContext)) {
             // #232: guarded - startScanner() unbinds and rebinds even when
