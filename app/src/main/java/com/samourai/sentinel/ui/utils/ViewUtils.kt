@@ -161,6 +161,11 @@ fun Activity.showFloatingSnackBar(parent_view: View, text: String = "", actionCl
     if(anchorView!=null){
         snackBar.setAnchorView(anchorView)
     }
+    // #460: the import screen dismisses this when a dialog opens. The
+    // bar is anchored to a bottom button and otherwise stays up over
+    // that dialog. Remember it before show(), which attaches later.
+    snackBar.view.setTag(R.id.floating_snackbar, snackBar)
+    window?.decorView?.setTag(R.id.floating_snackbar, snackBar)
     snackBar.show()
 
 }

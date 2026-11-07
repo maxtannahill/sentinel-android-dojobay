@@ -161,7 +161,14 @@ class RestorePinFollowUpTest {
         assertTrue(fresh.contains("protectFreshImport"))
         val success = launch.substringAfter("if (it == null)")
             .substringBefore("} else if (it is CancellationException)")
-        assertTrue(success.contains("applyRestorePinFollowUp(pinFollowUp)"))
+        // #460: the success block defers the restart snackbar, then
+        // applies the follow-up. The decision call stays on that path.
+        assertTrue(success.contains("presentSentinelImportSuccess("))
+        assertTrue(success.contains("pinFollowUp"))
+        val presenter = activitySource()
+            .substringAfter("fun presentSentinelImportSuccess")
+            .substringBefore("fun applyRestorePinFollowUp")
+        assertTrue(presenter.contains("applyRestorePinFollowUp(followUp)"))
         val afterSuccess = launch.substringAfter("} else if (it is CancellationException)")
         assertFalse(afterSuccess.contains("applyRestorePinFollowUp"))
 

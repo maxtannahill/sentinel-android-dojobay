@@ -35,4 +35,6 @@
     <item name="amountSAT" type="id" />
     <item name="address_type_spinner" type="id" />
     <item name="container_advance_options" type="id" />
+    <!-- Latest floating snackbar, so a dialog can dismiss it (#460). -->
+    <item name="floating_snackbar" type="id" />
 </resources>

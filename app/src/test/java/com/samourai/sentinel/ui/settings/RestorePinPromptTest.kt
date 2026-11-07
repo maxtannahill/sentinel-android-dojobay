@@ -6,12 +6,15 @@ import android.os.Bundle
 import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.test.core.app.ApplicationProvider
+import com.google.android.material.snackbar.Snackbar
 import com.samourai.sentinel.R
 import com.samourai.sentinel.core.access.AccessFactory
 import com.samourai.sentinel.ui.utils.PrefsUtil
+import com.samourai.sentinel.ui.utils.showFloatingSnackBar
 import com.samourai.sentinel.ui.views.LockScreenDialog
 import org.json.JSONObject
 import org.junit.After
@@ -319,6 +322,106 @@ class RestorePinPromptTest {
     }
 
     @Test
+    fun successOfferIsNotCoveredByTheImportButtonOrRestartSnackBar() {
+        val activity = launch()
+        val button = activity.findViewById<TextView>(R.id.importStartBtn)
+        // The start button is hidden until a backup is chosen, then the
+        // user taps it. Success runs with that button on screen.
+        button.visibility = View.VISIBLE
+        button.text = "Importing\u2026"
+        assertTrue(button.isShown)
+        activity.showFloatingSnackBar(
+            activity.findViewById(R.id.importPastePayloadBtn),
+            "Successfully imported collection(s).",
+            anchorView = R.id.importStartBtn,
+            actionText = "restart",
+            actionClick = {},
+        )
+        idle()
+        assertNotNull(visibleFloatingSnackBar(activity))
+
+        val message = "Successfully imported collection(s)."
+        activity.presentSentinelImportSuccess(message, RestorePinFollowUp.OFFER_SET)
+        idle()
+
+        val dialog = onlyAlert()
+        assertOfferCopy(activity, dialog)
+        assertImportChromeDoesNotCover(activity, dialog)
+        assertEquals("Imported \u2713", button.text.toString())
+        assertEquals(View.INVISIBLE, button.visibility)
+
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).performClick()
+        idle()
+        assertFalse(dialog.isShowing)
+        assertEquals(View.VISIBLE, button.visibility)
+        assertTrue(button.isShown)
+        assertEquals("Imported \u2713", button.text.toString())
+        val snack = visibleFloatingSnackBar(activity)
+        assertNotNull(snack)
+        val (snackMessage, snackAction) = snackBarCopy(snack!!)
+        assertEquals(message, snackMessage)
+        assertEquals("restart", snackAction)
+        assertTrue(shownAlerts().isEmpty())
+    }
+
+    @Test
+    fun setPinKeepsTheRestartSnackBarOffThePad() {
+        val activity = launch()
+        val button = activity.findViewById<View>(R.id.importStartBtn)
+        button.visibility = View.VISIBLE
+        assertTrue(button.isShown)
+        activity.presentSentinelImportSuccess(
+            "Successfully imported collection(s).",
+            RestorePinFollowUp.OFFER_SET,
+        )
+        idle()
+        val dialog = onlyAlert()
+        assertImportChromeDoesNotCover(activity, dialog)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+        idle()
+
+        assertNotNull(
+            activity.supportFragmentManager.findFragmentByTag(ImportBackUpActivity.TAG_RESTORE_PIN_SET),
+        )
+        assertTrue(shownAlerts().isEmpty())
+        assertNull(visibleFloatingSnackBar(activity))
+        assertEquals(View.INVISIBLE, button.visibility)
+        assertFalse(button.isShown)
+    }
+
+    @Test
+    fun keptPinNoticeIsNotCoveredByTheImportButtonOrRestartSnackBar() {
+        val activity = launch()
+        val button = activity.findViewById<View>(R.id.importStartBtn)
+        button.visibility = View.VISIBLE
+        assertTrue(button.isShown)
+        val message = "Successfully imported collection(s)."
+        activity.presentSentinelImportSuccess(message, RestorePinFollowUp.NOTICE_KEPT)
+        idle()
+
+        val dialog = onlyAlert()
+        val text = dialogText(dialog)
+        assertTrue(text.contains(activity.getString(R.string.restore_pin_kept_title)))
+        assertTrue(text.contains(activity.getString(R.string.restore_pin_kept_message)))
+        assertEquals(
+            activity.getString(R.string.ok),
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).text.toString(),
+        )
+        assertImportChromeDoesNotCover(activity, dialog)
+
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+        idle()
+        assertFalse(dialog.isShowing)
+        assertEquals(View.VISIBLE, button.visibility)
+        assertTrue(button.isShown)
+        val snack = visibleFloatingSnackBar(activity)
+        assertNotNull(snack)
+        val (snackMessage, snackAction) = snackBarCopy(snack!!)
+        assertEquals(message, snackMessage)
+        assertEquals("restart", snackAction)
+    }
+
+    @Test
     fun offerStringsDoNotCarryAPin() {
         val activity = launch()
         val copy = listOf(
@@ -335,6 +438,80 @@ class RestorePinPromptTest {
         assertFalse(copy.contains("from-backup"))
         assertTrue(copy.contains("PIN"))
         assertTrue(copy.contains("Not now"))
+    }
+
+    private fun assertOfferCopy(activity: ImportBackUpActivity, dialog: AlertDialog) {
+        val text = dialogText(dialog)
+        assertTrue(text.contains(activity.getString(R.string.restore_pin_offer_title)))
+        assertTrue(text.contains(activity.getString(R.string.restore_pin_offer_message)))
+        assertEquals(
+            activity.getString(R.string.restore_pin_set),
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).text.toString(),
+        )
+        assertEquals(
+            activity.getString(R.string.restore_pin_not_now),
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).text.toString(),
+        )
+    }
+
+    /**
+     * #460: the bottom import button and the restart snackbar must not
+     * be on screen over the dialog. The dialog actions stay shown,
+     * enabled, and in a window lifted above that chrome.
+     */
+    private fun assertImportChromeDoesNotCover(activity: ImportBackUpActivity, dialog: AlertDialog) {
+        val button = activity.findViewById<View>(R.id.importStartBtn)
+        assertFalse(button.isShown)
+        assertNull(visibleFloatingSnackBar(activity))
+        val positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+        assertTrue(positive.isShown)
+        assertTrue(positive.isEnabled)
+        assertTrue(positive.height > 0 || positive.measuredHeight > 0)
+        val negative = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+        if (negative != null && negative.text.isNotEmpty()) {
+            assertTrue(negative.isShown)
+            assertTrue(negative.isEnabled)
+            assertTrue(negative.height > 0 || negative.measuredHeight > 0)
+        }
+        val window = dialog.window
+        assertNotNull(window)
+        assertTrue(
+            window!!.attributes.flags and WindowManager.LayoutParams.FLAG_DIM_BEHIND != 0,
+        )
+        assertTrue(window.decorView.elevation >= 24f * activity.resources.displayMetrics.density)
+        assertFalse(rectsOverlap(button, positive))
+        if (negative != null && negative.text.isNotEmpty()) {
+            assertFalse(rectsOverlap(button, negative))
+        }
+    }
+
+    private fun rectsOverlap(first: View, second: View): Boolean {
+        if (!first.isShown || !second.isShown) return false
+        val a = android.graphics.Rect()
+        val b = android.graphics.Rect()
+        if (!first.getGlobalVisibleRect(a) || !second.getGlobalVisibleRect(b)) return false
+        return android.graphics.Rect.intersects(a, b)
+    }
+
+    private fun visibleFloatingSnackBar(activity: ImportBackUpActivity): Snackbar? {
+        val found = ArrayList<Snackbar>()
+        fun walk(view: View) {
+            val tagged = view.getTag(R.id.floating_snackbar) as? Snackbar
+            if (tagged != null && tagged.isShown && tagged.view.isShown) {
+                found.add(tagged)
+            }
+            if (view is ViewGroup) {
+                for (i in 0 until view.childCount) walk(view.getChildAt(i))
+            }
+        }
+        walk(activity.window.decorView)
+        return found.firstOrNull()
+    }
+
+    private fun snackBarCopy(bar: Snackbar): Pair<String, String> {
+        val message = bar.view.findViewById<TextView>(R.id.mainText)?.text?.toString().orEmpty()
+        val action = bar.view.findViewById<TextView>(R.id.actionButton)?.text?.toString().orEmpty()
+        return message to action
     }
 
     private fun launch(): ImportBackUpActivity {
