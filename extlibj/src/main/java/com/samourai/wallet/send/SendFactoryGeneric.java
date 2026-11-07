@@ -68,13 +68,14 @@ public class SendFactoryGeneric {
             Map.Entry<String, Long> mapEntry = iterator.next();
             String toAddress = mapEntry.getKey();
             BigInteger value = BigInteger.valueOf(mapEntry.getValue());
-/*
-            if(value.compareTo(SamouraiWallet.bDust) < 1)    {
-                throw new Exception(context.getString(R.string.dust_amount));
-            }
-*/
-            if(value == null || (value.compareTo(BigInteger.ZERO) <= 0 && !FormatsUtilGeneric.getInstance().isValidBIP47OpReturn(toAddress))) {
+            boolean bip47OpReturn = FormatsUtilGeneric.getInstance().isValidBIP47OpReturn(toAddress);
+            if(value == null || (value.compareTo(BigInteger.ZERO) <= 0 && !bip47OpReturn)) {
                 throw new MakeTxException("Invalid amount");
+            }
+            // #463: same threshold change selection uses. Outputs below bDust are
+            // non-standard; the threshold itself is payable. BIP47 OP_RETURN is unspendable.
+            if(value.compareTo(SamouraiWalletConst.bDust) < 0 && !bip47OpReturn) {
+                throw new MakeTxException("Dust amount");
             }
 
             try {

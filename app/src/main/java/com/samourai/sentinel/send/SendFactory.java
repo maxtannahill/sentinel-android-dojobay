@@ -3,6 +3,7 @@ package com.samourai.sentinel.send;
 import com.samourai.sentinel.core.SentinelState;
 import com.samourai.sentinel.sweep.MyTransactionInput;
 import com.samourai.sentinel.util.FormatsUtil;
+import com.samourai.wallet.SamouraiWalletConst;
 import com.samourai.wallet.segwit.bech32.Bech32UtilGeneric;
 import com.samourai.wallet.send.MyTransactionOutPoint;
 import com.samourai.wallet.util.FormatsUtilGeneric;
@@ -40,19 +41,8 @@ public class SendFactory	{
         return instance;
     }
 
-    public Transaction makeTransaction(final int accountIdx, final List<MyTransactionOutPoint> unspent, final HashMap<String, BigInteger> receivers) {
-
-        Transaction tx = null;
-
-        try {
-//            int changeIdx = HD_WalletFactory.getInstance(context).get().getAccount(accountIdx).getChange().getAddrIdx();
-            tx = makeTransaction(accountIdx, receivers, unspent);
-        }
-        catch(Exception e) {
-            e.printStackTrace();
-        }
-
-        return tx;
+    public Transaction makeTransaction(final int accountIdx, final List<MyTransactionOutPoint> unspent, final HashMap<String, BigInteger> receivers) throws Exception {
+        return makeTransaction(accountIdx, receivers, unspent);
     }
 
     /*
@@ -71,18 +61,19 @@ public class SendFactory	{
         for (Map.Entry<String, BigInteger> mapEntry : receivers.entrySet()) {
             String toAddress = mapEntry.getKey();
             BigInteger value = mapEntry.getValue();
-/*
-            if(value.compareTo(SamouraiWallet.bDust) < 1)    {
-                throw new Exception(context.getString(R.string.dust_amount));
-            }
-*/
-            if (value == null || (value.compareTo(BigInteger.ZERO) <= 0 && !FormatsUtilGeneric.getInstance().isValidBIP47OpReturn(toAddress))) {
+            boolean bip47OpReturn = FormatsUtilGeneric.getInstance().isValidBIP47OpReturn(toAddress);
+            if (value == null || (value.compareTo(BigInteger.ZERO) <= 0 && !bip47OpReturn)) {
                 throw new Exception("Invalid amount");
+            }
+            // #463: same threshold change selection uses. Outputs below bDust are
+            // non-standard; the threshold itself is payable. BIP47 OP_RETURN is unspendable.
+            if (value.compareTo(SamouraiWalletConst.bDust) < 0 && !bip47OpReturn) {
+                throw new Exception("Dust amount");
             }
 
             TransactionOutput output = null;
             Script toOutputScript = null;
-            if (!FormatsUtil.Companion.isValidBitcoinAddress(toAddress) && FormatsUtilGeneric.getInstance().isValidBIP47OpReturn(toAddress)) {
+            if (!FormatsUtil.Companion.isValidBitcoinAddress(toAddress) && bip47OpReturn) {
                 toOutputScript = new ScriptBuilder().op(ScriptOpCodes.OP_RETURN).data(Hex.decode(toAddress)).build();
                 output = new TransactionOutput(SentinelState.Companion.getNetworkParam(), null, Coin.valueOf(0L), toOutputScript.getProgram());
             } else if (FormatsUtil.Companion.isValidBech32(toAddress)) {
