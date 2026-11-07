@@ -291,7 +291,7 @@ class TransactionComposer {
                 SendFactory.getInstance()
                     .makeTransaction(accountIdx1.toInt(), outPoints, receivers)
             } catch (e: Exception) {
-                throw ComposeException("Unable to create tx")
+                throw ComposeException("Unable to create tx").apply { initCause(e) }
             }
 
             psbt = PSBT(transaction)
