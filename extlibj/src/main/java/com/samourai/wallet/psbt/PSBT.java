@@ -11,6 +11,7 @@ import org.bouncycastle.util.encoders.Base64;
 import org.bouncycastle.util.encoders.Hex;
 
 import java.io.*;
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -195,8 +196,8 @@ public class PSBT {
 
         int seenInputs = 0;
         int seenOutputs = 0;
-        int seenGlobals = 0;
 
+        parseOK = false;
         psbtBytes = Hex.decode(strPSBT);
         psbtByteBuffer = ByteBuffer.wrap(psbtBytes);
 
@@ -205,12 +206,23 @@ public class PSBT {
         Log("--- parsing header ---", true);
 
         byte[] magicBuf = new byte[4];
-        psbtByteBuffer.get(magicBuf);
+        try {
+            psbtByteBuffer.get(magicBuf);
+        }
+        catch(BufferUnderflowException e) {
+            throw new Exception("Truncated PSBT", e);
+        }
         if(!PSBT.PSBT_MAGIC.equalsIgnoreCase(Hex.toHexString(magicBuf)))    {
             throw new Exception("Invalid magic value");
         }
 
-        byte sep = psbtByteBuffer.get();
+        byte sep;
+        try {
+            sep = psbtByteBuffer.get();
+        }
+        catch(BufferUnderflowException e) {
+            throw new Exception("Truncated PSBT", e);
+        }
         if(sep != PSBT_HEADER_SEPARATOR)    {
             throw new Exception("Bad 0xff separator:" + Hex.toHexString(new byte[] { sep }));
         }
@@ -234,20 +246,16 @@ public class PSBT {
 
             PSBTEntry entry = parse();
             if(entry == null)    {
-                Log("parse returned null entry", true);
-//                exit(0);
+                throw new Exception("Truncated PSBT");
             }
             entry.setState(currentState);
 
             if(entry.getKey() == null)    {         // length == 0
                 switch (currentState)   {
                     case STATE_GLOBALS:
+                        // BIP-174 ends the global map at the first 0x00 separator.
                         psbtGlobals.add(entry);
-                        seenGlobals++;
-                        if(seenGlobals == 2) { // TODO: THIS NEEDS TO BE CHANGED
-                            // (it only works if we are expecting 2 globals)
-                            currentState = STATE_INPUTS;
-                        }
+                        currentState = STATE_INPUTS;
                         break;
                     case STATE_INPUTS:
                         psbtInputs.add(entry);
@@ -264,11 +272,9 @@ public class PSBT {
                         }
                         break;
                     case STATE_END:
-                        parseOK = true;
-                        break;
+                        throw new Exception("Trailing bytes after PSBT");
                     default:
-                        Log("unknown state", true);
-                        break;
+                        throw new Exception("Invalid PSBT state");
                 }
             }
             else if(currentState == STATE_GLOBALS)    {
@@ -287,7 +293,8 @@ public class PSBT {
                             Log("xpub: " + serializeXPUB(entry.getKeyData()), true);
                         break;
                     case PSBT.PSBT_GLOBAL_VERSION:
-                        Log("version:" + Integer.valueOf(Hex.toHexString(entry.getKeyData()), 10), true);
+                        // The version is the value. This key has no key data.
+                        Log("version:" + Hex.toHexString(entry.getData() == null ? new byte[0] : entry.getData()), true);
                         break;
                     case PSBT.PSBT_GLOBAL_PROPRIETARY:
                         Log("proprietary global data", true);
@@ -328,25 +335,31 @@ public class PSBT {
                 }
             }
             else if(currentState == STATE_END)    {
-                Log("end PSBT", true);
+                throw new Exception("Trailing bytes after PSBT");
             }
             else    {
-                Log("panic", true);
+                throw new Exception("Invalid PSBT state");
+            }
+
+            // Reaching the end state is not success while unread bytes remain.
+            if(currentState == STATE_END && psbtByteBuffer.hasRemaining())    {
+                throw new Exception("Trailing bytes after PSBT");
             }
 
         }
 
-        if(currentState == STATE_END)   {
-            Log("--- ***** END ***** ---", true);
-
-            parseOK = true;
+        if(currentState != STATE_END || transaction == null)   {
+            throw new Exception("Truncated PSBT");
         }
+
+        Log("--- ***** END ***** ---", true);
+        parseOK = true;
 
         Log("", true);
 
     }
 
-    private PSBTEntry parse()    {
+    private PSBTEntry parse() throws Exception    {
 
         PSBTEntry entry = new PSBTEntry();
 
@@ -389,10 +402,8 @@ public class PSBT {
             return entry;
 
         }
-        catch(Exception e) {
-            Log("Exception:" + e.getMessage(), true);
-            e.printStackTrace();
-            return null;
+        catch(BufferUnderflowException e) {
+            throw new Exception("Truncated PSBT", e);
         }
 
     }
@@ -538,31 +549,12 @@ public class PSBT {
         // separator
         baos.write(PSBT_HEADER_SEPARATOR);
 
-        //globals
+        // One unsigned-transaction global, then the BIP-174 0x00 separator.
         baos.write(writeCompactInt(1L));                                // key length
         baos.write((byte)0x00);                                             // key
         baos.write(txLen, 0, txLen.length);                             // value length
         baos.write(serialized, 0, serialized.length);                   // value
         baos.write((byte)0x00);
-/*
-        for(PSBTEntry entry : psbtGlobals)   {
-            if(entry.getKey() == null)   {
-                baos.write((byte)0x00);
-            }
-            else   {
-                int keyLen = 1;
-                if(entry.getKeyData() != null)    {
-                    keyLen += entry.getKeyData().length;
-                }
-                baos.write(writeCompactInt(keyLen));
-                baos.write(entry.getKey());
-                baos.write(writeCompactInt(entry.getData().length));
-                baos.write(entry.getData());
-            }
-        }
-
- */
-
 
         // inputs
         for(PSBTEntry entry : psbtInputs)   {
