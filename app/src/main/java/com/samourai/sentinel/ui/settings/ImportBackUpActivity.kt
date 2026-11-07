@@ -1,9 +1,11 @@
 package com.samourai.sentinel.ui.settings
 
+import android.animation.StateListAnimator
 import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.viewModels
 import androidx.appcompat.app.AlertDialog
@@ -50,8 +52,9 @@ import com.samourai.sentinel.util.readSamouraiPairingPayloadTrying
 import com.samourai.sentinel.util.apiScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -112,6 +115,23 @@ class ImportBackUpActivity : SentinelActivity() {
     private var restorePinNoticeDialog: AlertDialog? = null
     private var offerPinPending = false
     private var pinNoticePending = false
+
+    /**
+     * #460: success draws "Imported ✓" on [importStartBtn] and a
+     * restart snackbar anchored to that button, then opens the PIN
+     * dialog. The activity window is transparent (swipe-back) and both
+     * of those views are elevated, so they composite above the dialog
+     * and cover Set PIN / Not now. While the dialog (or the pad it
+     * opens) is up, the button is not drawn and the snackbar is gone.
+     * [pendingImportSuccessMessage] is shown once that UI is gone.
+     */
+    private var pendingImportSuccessMessage: String? = null
+    private var restorePinPadOpen = false
+    private var importButtonHeld = false
+    private var heldButtonVisibility = View.VISIBLE
+    private var heldButtonAnimator: StateListAnimator? = null
+    private var heldButtonElevation = 0f
+    private var heldButtonTranslationZ = 0f
 
     /**
      * #420: first entry of the set-PIN pad. Memory of this activity
@@ -224,6 +244,14 @@ class ImportBackUpActivity : SentinelActivity() {
             decryptPayload()
         }
         showImportButton(true)
+        // After the startup hide, so a restored dialog does not save
+        // the inflated VISIBLE and pop the button back on dismiss (#460).
+        if (savedInstanceState?.getBoolean(STATE_OFFER_PIN) == true ||
+            savedInstanceState?.getBoolean(STATE_PIN_NOTICE) == true ||
+            savedInstanceState?.getBoolean(STATE_HOLD_IMPORT_CHROME) == true
+        ) {
+            holdImportChromeBehindDialog()
+        }
     }
 
     /**
@@ -911,8 +939,6 @@ class ImportBackUpActivity : SentinelActivity() {
         }.invokeOnCompletion {
             runOnUiThread {
                 if (it == null) {
-                    binding.importStartBtn.text = "Imported \u2713"
-                    requireRestart = true
                     val xpubNote = xpubImport?.let { (ok, bad) ->
                         xpubRegistrationNote(ok, bad)
                     } ?: ""
@@ -933,13 +959,13 @@ class ImportBackUpActivity : SentinelActivity() {
                             " Dojo pairing failed - retry from Network screen."
                         else "") +
                         networkNote
-                    showFloatingSnackBar(
-                        binding.importPastePayloadBtn, "Successfully imported$importNoun.$note",
-                        anchorView = binding.importStartBtn.id,
-                        actionText = "restart",
-                        actionClick = { restart() }
+                    // #460: the restart snackbar is anchored to the bottom
+                    // button. Showing it before the PIN dialog covers the
+                    // dialog actions. The dialog is shown first.
+                    presentSentinelImportSuccess(
+                        "Successfully imported$importNoun.$note",
+                        pinFollowUp,
                     )
-                    applyRestorePinFollowUp(pinFollowUp)
                 } else if (it is CancellationException) {
                     // Scope teardown, not a failure (#80).
                     setImportBusy(false)
@@ -1079,6 +1105,37 @@ class ImportBackUpActivity : SentinelActivity() {
      * #420: after a successful Sentinel import. [followUp] was decided
      * before the write, so a PIN installed by the legacy verifier does
      * not also open the set-PIN offer.
+     *
+     * #460: the bottom import button and the restart snackbar are not
+     * drawn while the follow-up dialog is up. [message] is the success
+     * snackbar copy, shown once that dialog (and the set-PIN pad, when
+     * the user opens it) has closed.
+     */
+    internal fun presentSentinelImportSuccess(message: String, followUp: RestorePinFollowUp) {
+        binding.importStartBtn.text = "Imported \u2713"
+        requireRestart = true
+        when (followUp) {
+            RestorePinFollowUp.NONE -> showImportRestartSnackBar(message)
+            RestorePinFollowUp.OFFER_SET,
+            RestorePinFollowUp.NOTICE_KEPT -> {
+                pendingImportSuccessMessage = message
+                applyRestorePinFollowUp(followUp)
+                if (restorePinOfferDialog?.isShowing != true &&
+                    restorePinNoticeDialog?.isShowing != true &&
+                    pendingImportSuccessMessage != null
+                ) {
+                    val deferred = pendingImportSuccessMessage
+                    pendingImportSuccessMessage = null
+                    if (deferred != null) showImportRestartSnackBar(deferred)
+                }
+            }
+        }
+    }
+
+    /**
+     * #420: after a successful Sentinel import. [followUp] was decided
+     * before the write, so a PIN installed by the legacy verifier does
+     * not also open the set-PIN offer.
      */
     internal fun applyRestorePinFollowUp(followUp: RestorePinFollowUp) {
         when (followUp) {
@@ -1089,20 +1146,22 @@ class ImportBackUpActivity : SentinelActivity() {
     }
 
     private fun showRestorePinOffer() {
+        if (restorePinOfferDialog?.isShowing == true) {
+            offerPinPending = true
+            return
+        }
         if (!isKeylessInstall(
                 prefsUtil.isPinConfigured(),
                 AccessFactory.getInstance(null).dataKey,
             )
         ) {
             offerPinPending = false
+            releaseImportChromeBehindDialog()
             return
         }
-        if (restorePinOfferDialog?.isShowing == true) {
-            offerPinPending = true
-            return
-        }
+        holdImportChromeBehindDialog()
         offerPinPending = true
-        restorePinOfferDialog = MaterialAlertDialogBuilder(this)
+        val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.restore_pin_offer_title)
             .setMessage(R.string.restore_pin_offer_message)
             .setPositiveButton(R.string.restore_pin_set) { _, _ ->
@@ -1113,7 +1172,16 @@ class ImportBackUpActivity : SentinelActivity() {
                 offerPinPending = false
             }
             .setOnCancelListener { offerPinPending = false }
-            .show()
+            .setOnDismissListener {
+                // Set PIN opens the pad before this runs. Not now and
+                // cancel do not, so the success snackbar can return.
+                if (!restorePinPadOpen) {
+                    releaseImportChromeBehindDialog()
+                }
+            }
+            .create()
+        restorePinOfferDialog = dialog
+        showAboveImportChrome(dialog)
     }
 
     private fun showBackupPinNotApplied() {
@@ -1121,16 +1189,109 @@ class ImportBackUpActivity : SentinelActivity() {
             pinNoticePending = true
             return
         }
+        holdImportChromeBehindDialog()
         pinNoticePending = true
-        restorePinNoticeDialog = MaterialAlertDialogBuilder(this)
+        val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.restore_pin_kept_title)
             .setMessage(R.string.restore_pin_kept_message)
             .setPositiveButton(R.string.ok, null)
-            .setOnDismissListener { pinNoticePending = false }
-            .show()
+            .setOnDismissListener {
+                pinNoticePending = false
+                releaseImportChromeBehindDialog()
+            }
+            .create()
+        restorePinNoticeDialog = dialog
+        showAboveImportChrome(dialog)
+    }
+
+    /**
+     * #460: floating dialog above the import screen. The theme leaves
+     * dimming off; turn it on for this window and lift it above the
+     * bottom button and the snackbar.
+     */
+    private fun showAboveImportChrome(dialog: AlertDialog) {
+        dialog.show()
+        dialog.window?.let { window ->
+            window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            window.setDimAmount(0.32f)
+            val px = 32f * resources.displayMetrics.density
+            window.setElevation(px)
+            window.decorView.elevation = px
+        }
+    }
+
+    private fun showImportRestartSnackBar(message: String) {
+        showFloatingSnackBar(
+            binding.importPastePayloadBtn,
+            message,
+            anchorView = binding.importStartBtn.id,
+            actionText = "restart",
+            actionClick = { restart() },
+        )
+    }
+
+    private fun holdImportChromeBehindDialog() {
+        dismissFloatingSnackBars()
+        if (importButtonHeld) return
+        val button = binding.importStartBtn
+        importButtonHeld = true
+        heldButtonVisibility = button.visibility
+        heldButtonAnimator = button.stateListAnimator
+        heldButtonElevation = button.elevation
+        heldButtonTranslationZ = button.translationZ
+        button.stateListAnimator = null
+        button.elevation = 0f
+        button.translationZ = 0f
+        // INVISIBLE keeps the button's space so the screen does not jump,
+        // and it is not drawn over the dialog actions.
+        button.visibility = View.INVISIBLE
+    }
+
+    private fun releaseImportChromeBehindDialog() {
+        if (importButtonHeld) {
+            val button = binding.importStartBtn
+            button.visibility = heldButtonVisibility
+            button.elevation = heldButtonElevation
+            button.translationZ = heldButtonTranslationZ
+            button.stateListAnimator = heldButtonAnimator
+            importButtonHeld = false
+        }
+        val message = pendingImportSuccessMessage ?: return
+        pendingImportSuccessMessage = null
+        if (isFinishing || isDestroyed) return
+        // Next loop, after the dialog window is gone. Showing it inside
+        // the dismiss listener puts the restart action over the dialog.
+        binding.root.post {
+            if (!isFinishing && !isDestroyed) showImportRestartSnackBar(message)
+        }
+    }
+
+    private fun dismissFloatingSnackBars() {
+        val decor = window?.decorView ?: return
+        val bars = LinkedHashSet<Snackbar>()
+        (decor.getTag(R.id.floating_snackbar) as? Snackbar)?.let { bars.add(it) }
+        decor.setTag(R.id.floating_snackbar, null)
+        collectTaggedSnackBars(decor, bars)
+        bars.forEach { bar ->
+            // Hide before dismiss so the exit slide cannot cross the dialog.
+            bar.view.visibility = View.GONE
+            bar.dismiss()
+        }
+    }
+
+    private fun collectTaggedSnackBars(view: View, bars: MutableSet<Snackbar>) {
+        (view.getTag(R.id.floating_snackbar) as? Snackbar)?.let { bars.add(it) }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) {
+                collectTaggedSnackBars(view.getChildAt(i), bars)
+            }
+        }
     }
 
     private fun showRestoreSetPinPad() {
+        // Set before the offer dialog dismisses, so that dismiss does not
+        // put the restart snackbar on top of this pad (#460).
+        restorePinPadOpen = true
         if (supportFragmentManager.findFragmentByTag(TAG_RESTORE_PIN_SET) != null) return
         val dialog = LockScreenDialog.newInstance(
             message = getString(R.string.create_pin),
@@ -1181,6 +1342,13 @@ class ImportBackUpActivity : SentinelActivity() {
                 AccessFactory.getInstance(null).dataKey,
             )
         ) {
+            // The pad is removed with commit(), which runs after this
+            // returns. Release once it is gone so the button does not
+            // draw over the last frame of the pad.
+            binding.root.post {
+                restorePinPadOpen = false
+                releaseImportChromeBehindDialog()
+            }
             return
         }
         viewModel.viewModelScope.launch(Dispatchers.IO) {
@@ -1209,6 +1377,13 @@ class ImportBackUpActivity : SentinelActivity() {
                         Toast.LENGTH_LONG,
                     ).show()
                 }
+            } finally {
+                // After the saving dialog is gone. Doing it earlier puts
+                // the restart snackbar over that dialog (#460).
+                withContext(Dispatchers.Main + NonCancellable) {
+                    restorePinPadOpen = false
+                    releaseImportChromeBehindDialog()
+                }
             }
         }
     }
@@ -1232,6 +1407,7 @@ class ImportBackUpActivity : SentinelActivity() {
         super.onSaveInstanceState(outState)
         outState.putBoolean(STATE_OFFER_PIN, offerPinPending)
         outState.putBoolean(STATE_PIN_NOTICE, pinNoticePending)
+        outState.putBoolean(STATE_HOLD_IMPORT_CHROME, importButtonHeld)
     }
 
     override fun onDestroy() {
@@ -1244,6 +1420,7 @@ class ImportBackUpActivity : SentinelActivity() {
         // listeners first keeps a teardown dismiss from looking like
         // the user pressed Not now after the state was already saved.
         restorePinOfferDialog?.setOnCancelListener(null)
+        restorePinOfferDialog?.setOnDismissListener(null)
         restorePinOfferDialog?.dismiss()
         restorePinNoticeDialog?.setOnDismissListener(null)
         restorePinNoticeDialog?.dismiss()
@@ -1272,5 +1449,6 @@ class ImportBackUpActivity : SentinelActivity() {
         const val REQUEST_KEY_RESTORE_PIN_CONFIRM = "lock_screen_restore_confirm_result"
         private const val STATE_OFFER_PIN = "restore_offer_pin"
         private const val STATE_PIN_NOTICE = "restore_pin_notice"
+        private const val STATE_HOLD_IMPORT_CHROME = "restore_pin_hold_import_chrome"
     }
 }
