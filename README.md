@@ -86,7 +86,7 @@ Labels are a first-class subsystem:
 - **BIP-329** is the storage format: import/export/edit/render with total
   parser semantics (absent label = do not alter, empty = explicit clear,
   cross-network refs rejected, origin and createdAt preserved).
-  Interoperability includes Ashigaru Desktop, Sparrow, and other BIP-329
+  Interoperability includes Sparrow, Ashigaru Desktop, and other BIP-329
   wallets. A round-trip was verified against Sparrow in both directions.
   Labels are privacy-sensitive metadata: stored locally only, network-scoped,
   hidden under street mode.
