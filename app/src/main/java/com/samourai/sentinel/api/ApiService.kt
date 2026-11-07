@@ -396,7 +396,11 @@ open class ApiService {
 
 
     suspend fun request(request: Request, excludeApiKey: Boolean = true): Response {
-        buildClient(excludeApiKey=excludeApiKey)
+        // #468: request() is the third-party surface - every caller is one
+        // of the five exchange providers. Their 401s must never reach the
+        // Dojo TokenAuthenticator: it would burn a real Dojo re-login and
+        // retry the exchange URL with `at=<Dojo access token>` appended.
+        buildClient(excludeApiKey = excludeApiKey, excludeAuthenticator = true)
         return client.newCall(request).await()
     }
 
@@ -568,7 +572,12 @@ open class ApiService {
                         val original = chain.request()
                         // Re-read on every call so a refreshed token takes effect.
                         val token = currentAuthToken() ?: authToken
-                        if (!token.isNullOrEmpty() && SentinelState.isDojoEnabled()) {
+                        // #468: belt and braces - this client is only built Dojo-bound
+                        // today, but if the at-interceptor ever lands in one aimed
+                        // elsewhere, the token must not follow the request off the
+                        // configured endpoint.
+                        if (!token.isNullOrEmpty() && SentinelState.isDojoEnabled() &&
+                            TokenAuthenticator.isDojoTarget(url, original.url)) {
                             val url = original.url.newBuilder()
                                 // Drop any stale token before adding the fresh one,
                                 // otherwise a retried request carries both.

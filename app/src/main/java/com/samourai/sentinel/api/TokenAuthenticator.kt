@@ -3,6 +3,8 @@ package com.samourai.sentinel.api
 import com.samourai.sentinel.ui.utils.PrefsUtil
 import kotlinx.coroutines.runBlocking
 import okhttp3.Authenticator
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.Route
@@ -34,12 +36,38 @@ class TokenAuthenticator(private val apiService: ApiService) : Authenticator {
     companion object {
         /** Max consecutive re-auth attempts for one logical request. */
         private const val MAX_RETRIES = 2
+
+        /**
+         * #468: true when [target] speaks to the configured Dojo endpoint.
+         *
+         * Strict on scheme, host and effective port - a credential gate
+         * fails closed, so anything but an exact origin match is false.
+         * okhttp resolves default ports, so an endpoint configured without
+         * one still matches the 80/443 the request actually used.
+         */
+        internal fun isDojoTarget(configuredUrl: String?, target: HttpUrl): Boolean {
+            val configured = configuredUrl?.toHttpUrlOrNull() ?: return false
+            return configured.scheme == target.scheme &&
+                configured.host.equals(target.host, ignoreCase = true) &&
+                configured.port == target.port
+        }
     }
 
     override fun authenticate(route: Route?, response: Response): Request? {
         // Give up rather than loop forever if the server keeps rejecting us.
         if (responseCount(response) >= MAX_RETRIES) {
             Timber.w("Dojo re-auth failed after $MAX_RETRIES attempts; giving up")
+            return null
+        }
+
+        // #468: this authenticator exists for exactly one origin - the
+        // configured Dojo endpoint. A 401 from anywhere else (the exchange
+        // providers routed through ApiService.request()) is not ours to
+        // answer: return null and fail the call rather than burn a Dojo
+        // re-login and retry a third-party URL with `at=<Dojo token>`.
+        // A missing or unparseable endpoint fails closed the same way.
+        if (!isDojoTarget(runCatching { apiService.getAPIUrl() }.getOrNull(), response.request.url)) {
+            Timber.w("TokenAuthenticator: 401 from non-Dojo origin; declining to attach the Dojo token")
             return null
         }
 
