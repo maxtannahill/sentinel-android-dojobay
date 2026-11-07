@@ -619,7 +619,6 @@ class SendFragment : Fragment() {
             val fiatRate = btc.times(rate.rate)
             setFiatEdit(DecimalFormat.getNumberInstance().format(fiatRate))
             viewModel.setAmount(amount)
-            print("Setting amount: " + amount)
         } catch (Ex: Exception) {
 
         }
@@ -658,7 +657,6 @@ class SendFragment : Fragment() {
             val btc: Double = MonetaryUtil.getInstance().formatToBtc((btcRate * 1e8).toLong()).toDouble()
             amount = btc
             viewModel.setAmount(amount)
-            print("Setting amount: " + amount)
         } catch (Ex: Exception) {
 
         }
