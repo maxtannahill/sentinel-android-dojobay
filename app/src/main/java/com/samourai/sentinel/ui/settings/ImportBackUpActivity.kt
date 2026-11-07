@@ -4,13 +4,16 @@ import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Toast
 import androidx.activity.viewModels
+import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
 import androidx.core.widget.addTextChangedListener
 import androidx.fragment.app.FragmentTransaction
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.transition.TransitionManager
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.transition.MaterialSharedAxis
 import com.samourai.sentinel.R
@@ -100,6 +103,23 @@ class ImportBackUpActivity : SentinelActivity() {
         Timber.e(t, "import failed")
     }
 
+    /**
+     * #420: the offer and the "backup PIN not applied" notice. Neither
+     * is a fragment, so a recreated activity shows them again from
+     * [onSaveInstanceState]. The PIN typed on the pad is not saved.
+     */
+    private var restorePinOfferDialog: AlertDialog? = null
+    private var restorePinNoticeDialog: AlertDialog? = null
+    private var offerPinPending = false
+    private var pinNoticePending = false
+
+    /**
+     * #420: first entry of the set-PIN pad. Memory of this activity
+     * only, same rule as the settings confirm step (#220): a recreated
+     * activity has none, and the confirm pad is closed.
+     */
+    private var pendingRestorePin: String? = null
+
     override fun onCreateAdmitted(savedInstanceState: Bundle?) {
         binding = ActivityImportBackUpBinding.inflate(layoutInflater)
         val view = binding.root
@@ -125,6 +145,43 @@ class ImportBackUpActivity : SentinelActivity() {
         }
         if (supportFragmentManager.findFragmentByTag(TAG_IMPORT_PIN) != null && importPinContinuation == null) {
             dismissImportPinDialog()
+        }
+        // #420: the set-PIN pad posts here. Confirm compares against
+        // pendingRestorePin, which is not saved, so a restored confirm
+        // pad is closed and the enter pad underneath can be used again.
+        supportFragmentManager.setFragmentResultListener(
+            REQUEST_KEY_RESTORE_PIN_SET,
+            this
+        ) { _, bundle ->
+            supportFragmentManager.clearFragmentResult(REQUEST_KEY_RESTORE_PIN_SET)
+            onRestorePinEntered(bundle.getString(LockScreenDialog.RESULT_PIN).orEmpty())
+        }
+        supportFragmentManager.setFragmentResultListener(
+            REQUEST_KEY_RESTORE_PIN_CONFIRM,
+            this
+        ) { _, bundle ->
+            supportFragmentManager.clearFragmentResult(REQUEST_KEY_RESTORE_PIN_CONFIRM)
+            onRestorePinConfirmed(bundle.getString(LockScreenDialog.RESULT_PIN).orEmpty())
+        }
+        if (supportFragmentManager.findFragmentByTag(TAG_RESTORE_PIN_CONFIRM) != null &&
+            pendingRestorePin == null
+        ) {
+            dismissRestorePinPad(TAG_RESTORE_PIN_CONFIRM)
+        }
+        // The window token is not ready inside onCreate. Posting the
+        // dialog keeps a restored prompt on screen after rotation
+        // without showing it before the activity has a window.
+        if (savedInstanceState?.getBoolean(STATE_OFFER_PIN) == true) {
+            offerPinPending = true
+            binding.root.post {
+                if (!isDestroyed && !isFinishing) showRestorePinOffer()
+            }
+        }
+        if (savedInstanceState?.getBoolean(STATE_PIN_NOTICE) == true) {
+            pinNoticePending = true
+            binding.root.post {
+                if (!isDestroyed && !isFinishing) showBackupPinNotApplied()
+            }
         }
 
         // #282: the password field can be revealed (eye icon, which also
@@ -440,8 +497,11 @@ class ImportBackUpActivity : SentinelActivity() {
                     // Older backups include a PIN verifier. Confirm it before
                     // writing. A device that does not already have one then
                     // stores that PIN in the current key format.
+                    // #420: a current-format backup has neither key. That
+                    // restore does not set a PIN; the success path offers
+                    // to set one when this install has none.
                     val legacyPinHash = payload.second.optString("pinHash", "")
-                    if (payload.second.optBoolean("pinEnabled", false) && legacyPinHash.isNotEmpty()) {
+                    if (backupCarriesLegacyPinVerifier(payload.second)) {
                         if (supportFragmentManager.findFragmentByTag(TAG_IMPORT_PIN) != null) {
                             setImportBusy(false)
                             return@launch
@@ -765,6 +825,17 @@ class ImportBackUpActivity : SentinelActivity() {
         // outside that scope and must close over these (#48).
         var xpubImport: Pair<Int, Int>? = null
         var dojoPairingFailed = false
+        // #420: captured before protectFreshImport. A legacy verifier on
+        // a keyless install enables during the import, and reading PIN
+        // state again at the end would hide the "already had a PIN" case
+        // and would also offer a second PIN after the first was just set.
+        val pinFollowUp = restorePinFollowUp(
+            legacyVerifierAccepted = freshPin != null,
+            deviceHadPin = !isKeylessInstall(
+                prefsUtil.isPinConfigured(),
+                AccessFactory.getInstance(null).dataKey,
+            ),
+        )
         viewModel.viewModelScope.launch(Dispatchers.IO + importExceptionHandler) {
             try {
                 if (freshPin != null) {
@@ -868,6 +939,7 @@ class ImportBackUpActivity : SentinelActivity() {
                         actionText = "restart",
                         actionClick = { restart() }
                     )
+                    applyRestorePinFollowUp(pinFollowUp)
                 } else if (it is CancellationException) {
                     // Scope teardown, not a failure (#80).
                     setImportBusy(false)
@@ -1003,9 +1075,163 @@ class ImportBackUpActivity : SentinelActivity() {
         }
     }
 
+    /**
+     * #420: after a successful Sentinel import. [followUp] was decided
+     * before the write, so a PIN installed by the legacy verifier does
+     * not also open the set-PIN offer.
+     */
+    internal fun applyRestorePinFollowUp(followUp: RestorePinFollowUp) {
+        when (followUp) {
+            RestorePinFollowUp.OFFER_SET -> showRestorePinOffer()
+            RestorePinFollowUp.NOTICE_KEPT -> showBackupPinNotApplied()
+            RestorePinFollowUp.NONE -> Unit
+        }
+    }
+
+    private fun showRestorePinOffer() {
+        if (!isKeylessInstall(
+                prefsUtil.isPinConfigured(),
+                AccessFactory.getInstance(null).dataKey,
+            )
+        ) {
+            offerPinPending = false
+            return
+        }
+        if (restorePinOfferDialog?.isShowing == true) {
+            offerPinPending = true
+            return
+        }
+        offerPinPending = true
+        restorePinOfferDialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.restore_pin_offer_title)
+            .setMessage(R.string.restore_pin_offer_message)
+            .setPositiveButton(R.string.restore_pin_set) { _, _ ->
+                offerPinPending = false
+                showRestoreSetPinPad()
+            }
+            .setNegativeButton(R.string.restore_pin_not_now) { _, _ ->
+                offerPinPending = false
+            }
+            .setOnCancelListener { offerPinPending = false }
+            .show()
+    }
+
+    private fun showBackupPinNotApplied() {
+        if (restorePinNoticeDialog?.isShowing == true) {
+            pinNoticePending = true
+            return
+        }
+        pinNoticePending = true
+        restorePinNoticeDialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.restore_pin_kept_title)
+            .setMessage(R.string.restore_pin_kept_message)
+            .setPositiveButton(R.string.ok, null)
+            .setOnDismissListener { pinNoticePending = false }
+            .show()
+    }
+
+    private fun showRestoreSetPinPad() {
+        if (supportFragmentManager.findFragmentByTag(TAG_RESTORE_PIN_SET) != null) return
+        val dialog = LockScreenDialog.newInstance(
+            message = getString(R.string.create_pin),
+            requestKey = REQUEST_KEY_RESTORE_PIN_SET,
+            purpose = LockScreenDialog.PURPOSE_SET,
+        )
+        supportFragmentManager.beginTransaction()
+            .setTransition(FragmentTransaction.TRANSIT_FRAGMENT_FADE)
+            .add(android.R.id.content, dialog, TAG_RESTORE_PIN_SET)
+            .commit()
+    }
+
+    private fun onRestorePinEntered(pin: String) {
+        val dialog = supportFragmentManager.findFragmentByTag(TAG_RESTORE_PIN_SET) as? LockScreenDialog
+            ?: return
+        if (dialog.purpose != LockScreenDialog.PURPOSE_SET) return
+        pendingRestorePin = pin
+        if (supportFragmentManager.findFragmentByTag(TAG_RESTORE_PIN_CONFIRM) != null) return
+        val confirm = LockScreenDialog.newInstance(
+            message = getString(R.string.confirm_pin),
+            requestKey = REQUEST_KEY_RESTORE_PIN_CONFIRM,
+            purpose = LockScreenDialog.PURPOSE_CONFIRM,
+        )
+        supportFragmentManager.beginTransaction()
+            .setTransition(FragmentTransaction.TRANSIT_FRAGMENT_FADE)
+            .add(android.R.id.content, confirm, TAG_RESTORE_PIN_CONFIRM)
+            .commit()
+    }
+
+    private fun onRestorePinConfirmed(pin: String) {
+        val dialog = supportFragmentManager.findFragmentByTag(TAG_RESTORE_PIN_CONFIRM) as? LockScreenDialog
+        val first = pendingRestorePin
+        if (dialog == null || dialog.purpose != LockScreenDialog.PURPOSE_CONFIRM || first == null) {
+            pendingRestorePin = null
+            dismissRestorePinPad(TAG_RESTORE_PIN_CONFIRM)
+            return
+        }
+        if (pin != first) {
+            Toast.makeText(this, getString(R.string.restore_pin_mismatch), Toast.LENGTH_SHORT).show()
+            dialog.showError()
+            return
+        }
+        pendingRestorePin = null
+        val chosen = first
+        dismissRestorePinPads()
+        if (!isKeylessInstall(
+                prefsUtil.isPinConfigured(),
+                AccessFactory.getInstance(null).dataKey,
+            )
+        ) {
+            return
+        }
+        viewModel.viewModelScope.launch(Dispatchers.IO) {
+            try {
+                protectImportedPin(
+                    show = { kdfOverlay.show(it) },
+                    dismiss = { kdfOverlay.dismiss() },
+                ) {
+                    enablePinOnKeylessInstall(
+                        PinVault(prefsUtil),
+                        chosen,
+                        appWalletPayloads(filesDir),
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // The PIN value, its verifier, and the wrapped key stay
+                // out of the log. The failure class is enough to tell a
+                // wrap error from a payload rewrite.
+                Timber.w("Could not save PIN after restore (${e.javaClass.simpleName})")
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(
+                        this@ImportBackUpActivity,
+                        getString(R.string.restore_pin_save_failed),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun dismissRestorePinPad(tag: String) {
+        val existing = supportFragmentManager.findFragmentByTag(tag) ?: return
+        supportFragmentManager.beginTransaction().remove(existing).commit()
+    }
+
+    private fun dismissRestorePinPads() {
+        dismissRestorePinPad(TAG_RESTORE_PIN_CONFIRM)
+        dismissRestorePinPad(TAG_RESTORE_PIN_SET)
+    }
+
     private fun dismissImportPinDialog() {
         val existing = supportFragmentManager.findFragmentByTag(TAG_IMPORT_PIN) ?: return
         supportFragmentManager.beginTransaction().remove(existing).commit()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_OFFER_PIN, offerPinPending)
+        outState.putBoolean(STATE_PIN_NOTICE, pinNoticePending)
     }
 
     override fun onDestroy() {
@@ -1014,6 +1240,13 @@ class ImportBackUpActivity : SentinelActivity() {
         // the window. Also covers the decrypt wait (#355). Safe if the
         // overlay was never shown, and safe if the job dismisses too.
         kdfOverlay.dismiss()
+        // #420: drop the windows with the activity. Clearing the
+        // listeners first keeps a teardown dismiss from looking like
+        // the user pressed Not now after the state was already saved.
+        restorePinOfferDialog?.setOnCancelListener(null)
+        restorePinOfferDialog?.dismiss()
+        restorePinNoticeDialog?.setOnDismissListener(null)
+        restorePinNoticeDialog?.dismiss()
         super.onDestroy()
     }
 
@@ -1033,5 +1266,11 @@ class ImportBackUpActivity : SentinelActivity() {
         const val REQUEST_FILE_CODE = 44
         const val TAG_IMPORT_PIN = "lock_screen_import"
         const val REQUEST_KEY_IMPORT_PIN = "lock_screen_import_result"
+        const val TAG_RESTORE_PIN_SET = "lock_screen_restore_set"
+        const val TAG_RESTORE_PIN_CONFIRM = "lock_screen_restore_confirm"
+        const val REQUEST_KEY_RESTORE_PIN_SET = "lock_screen_restore_set_result"
+        const val REQUEST_KEY_RESTORE_PIN_CONFIRM = "lock_screen_restore_confirm_result"
+        private const val STATE_OFFER_PIN = "restore_offer_pin"
+        private const val STATE_PIN_NOTICE = "restore_pin_notice"
     }
 }

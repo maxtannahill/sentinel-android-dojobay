@@ -59,6 +59,15 @@
     <string name="pin_error">Pin code error</string>
     <!-- #415: wrong-PIN advisory swapped into the prompt slot. -->
     <string name="pin_incorrect" translatable="false">Incorrect PIN</string>
+    <!-- #420: a current-format restore carries no PIN. The offer is a dialog. -->
+    <string name="restore_pin_offer_title" translatable="false">No PIN on this device</string>
+    <string name="restore_pin_offer_message" translatable="false">This backup has no PIN on this device. Set a PIN now?</string>
+    <string name="restore_pin_set" translatable="false">Set PIN</string>
+    <string name="restore_pin_not_now" translatable="false">Not now</string>
+    <string name="restore_pin_kept_title" translatable="false">Backup PIN not applied</string>
+    <string name="restore_pin_kept_message" translatable="false">This device already has a PIN, so the PIN from the backup was not applied.</string>
+    <string name="restore_pin_mismatch" translatable="false">Pins are not the same</string>
+    <string name="restore_pin_save_failed" translatable="false">Could not save PIN</string>
     <string name="no_internet">No Internet connectivity. Please try again.</string>
     <string name="bip38_pw">BIP38 password</string>
     <string name="bip38_pw_error">BIP38 password error</string>
