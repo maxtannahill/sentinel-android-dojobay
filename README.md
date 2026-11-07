@@ -21,7 +21,7 @@ onboarding, BIP84 default, UTXO labels, staging CI, and Network screen fixes",
 2026-09-06) and continues the maintenance arc here. Work flows back upstream
 via pull requests — our BIP-329 work was offered upstream (btcwrestle#5) and
 closed unmerged while upstream has been quiet since September 2026, so this
-repository is the live continuation as of October 2026. The histories share a
+repository is the live continuation as of November 2026. The histories share a
 common root; upstream holds nothing we lack.
 
 ## What this fork has done since the fork point
@@ -46,33 +46,35 @@ common root; upstream holds nothing we lack.
 | Connection light GREEN only at full bootstrap; staged climb UX | done (#99, #134) |
 | Dojo boot gating: sync/websocket wait on boot=100 + SOCKS listener | done (#135 arc: #136-#139) |
 | Entropy kill switch (nothing displays pending the re-enable design) | done (#106) |
+| Bad Bank chips rendered in tx details and tx list | done (#55) |
+| Bip329Parser network classification unified with NetworkClassifier | done (#64) |
+| CancellationException de-laundered at BroadcastTx and ImportSegWitService | done (#129) |
+| Sensitive-data masking: logcat onion hostnames, shared-storage pairing payload | done (#96) |
+| Mid-sync tx-table flicker and "Sync interrupted." flash | done (#124, #132) |
+| Fork versioning identity and release line decided | done (#66) |
+| BBQr label import: Sparrow B$ frames accumulated, reassembled, imported | done (#70; #453, #454, #457) |
 
-## Currently open (backlog as of 2026-10-11, every line verified against the tracker)
+## Currently open (backlog as of 2026-11-07, every line verified against the tracker)
 
 - Bad Bank Tainted — mixed-input propagation, phase 2 of #46 — #54
-- Bad Bank chips in tx details and tx list — #55
 - Per-tx entropy re-enable, tiered: local <=5x5, am-i.exposed deep link for
   wide rounds, boltzmann-rs port for 6x6-9x9 — #107
-- CancellationException laundering at BroadcastTx and ImportSegWitService — #129
-- Mid-sync tx-table flicker / tx-sheet kick-out on fresh re-pair — #124
-- "Sync interrupted." flash on routine refresh — #132
 - Tor connection streamline (dormancy wake, post-bootstrap onion latency) — #135
 - Dead-code sweep — sweep/ package, WebUtil stubs, send/PushTx trustedNode,
   LBC/BFX constants — #79
-- Mask sensitive data — dojo onion hostnames in logcat traces, XPUB/pairing
-  payload handling in shared storage — #96
 - 16 KB page-size for native libs (camera libs compliant; Tor leg pending
   kmp-tor-resource#192; benign while sideloaded) — #20
 - Remaining on-device smoke debt: Dojo pairing/sync, websocket reconnect,
   animated-UR scan — #36
-- Bip329Parser network classification unification with NetworkClassifier — #64
-- BBQR (BQR:) label import alongside animated UR — #70
 - Animated-UR label scan UX (minutes-long scans on small exports) — #71
+- Faster camera label import after 6.0: decoder, resolution, multi-QR, file
+  import — #455
+- ImportSegWitService passes XPUB and account type as Intent extras — #465
+- Tx-facts destination: Route A retired, explorer button retained — #119
 - Fee defaults 1-4 s/vb unusable on congested mempool — #77
 - Analytics provider chooser (local-first, separate PR) — #8
 - OXT seen-backend successor when an API lands — #9
 - Vendored bitcoinj suite fails locally on Kali JDK (locale data; CI green) — #75
-- Fork version line: stay v5.1.3-dojobay.N or major-bump to v6.0.0 — #66
 
 ## Label engine
 
