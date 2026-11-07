@@ -257,10 +257,21 @@ class BroadcastTx : SentinelActivity() {
         } catch (ex: Exception) {
             try {
                 val psbt = PSBT.fromBytes(Hex.decode(hex), SentinelState.getNetworkParam())
+                // #464: the payload parsed as a PSBT - that is not an
+                // incompatible format, it is the wrong artifact for this
+                // screen. Broadcast sends a raw signed transaction; the
+                // finalized export comes from the signer's side. One message
+                // for partial and fully-signed PSBTs alike - per-input
+                // signature inspection stays deferred with the issue, and no
+                // broadcast starts from a parsed PSBT.
+                val psbtText =
+                    "PSBT detected — Broadcast needs the signed raw " +
+                    "transaction. Export the finalized transaction from " +
+                    "your signer."
                 withContext(Dispatchers.Main) {
                     Toast.makeText(
                         applicationContext,
-                        errorText,
+                        psbtText,
                         Toast.LENGTH_LONG
                     ).show()
                     disableBtn(binding.broadCastTransactionBtn, false)
