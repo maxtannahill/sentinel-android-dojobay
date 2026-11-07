@@ -3,6 +3,7 @@ package com.samourai.sentinel.ui.collectionDetails.send
 import android.app.Application
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
+import com.samourai.sentinel.api.ApiService
 import com.samourai.sentinel.core.SentinelState
 import com.samourai.sentinel.core.hd.HD_Account
 import com.samourai.sentinel.data.AddressTypes
@@ -18,9 +19,11 @@ import com.samourai.wallet.util.XPUB
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.bitcoinj.core.Coin
 import org.bitcoinj.core.ECKey
 import org.bitcoinj.core.NetworkParameters
 import org.bitcoinj.core.Transaction
+import org.bitcoinj.core.TransactionOutput
 import org.bitcoinj.crypto.ChildNumber
 import org.bitcoinj.crypto.HDKeyDerivation
 import org.bouncycastle.util.encoders.Hex
@@ -29,6 +32,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
+import org.junit.BeforeClass
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.koin.android.ext.koin.androidContext
@@ -36,10 +40,15 @@ import org.koin.core.context.GlobalContext
 import org.koin.core.context.startKoin
 import org.koin.core.context.stopKoin
 import org.koin.dsl.module
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.math.BigInteger
+import java.net.InetAddress
 
 /**
  * #190: [TransactionComposer.compose] with explicitSelection = true spends
@@ -57,7 +66,7 @@ class ExplicitSelectionComposeTest {
 
     @Before
     fun setUp() {
-        ensureRuntime()
+        ensureRuntime(serverUrl())
         val suggested = SuggestedFee()
         suggested.defaultPerKB = BigInteger.valueOf(1000L)
         FeeUtil.getInstance().suggestedFee = suggested
@@ -69,8 +78,8 @@ class ExplicitSelectionComposeTest {
         // Baseline for the next test: the auto path's single-UTXO pass.
         val tx = compose(
             utxos = listOf(
-                wallet.utxo(10_000_000L, 0, txid(1)),
-                wallet.utxo(1_000_000L, 1, txid(2))
+                wallet.funded(10_000_000L, 0),
+                wallet.funded(1_000_000L, 1)
             ),
             amountSats = 50_000L,
             explicit = false
@@ -82,51 +91,51 @@ class ExplicitSelectionComposeTest {
     fun explicitSelectionSpendsEveryPinnedCoin() {
         val tx = compose(
             utxos = listOf(
-                wallet.utxo(10_000_000L, 0, txid(1)),
-                wallet.utxo(1_000_000L, 1, txid(2))
+                wallet.funded(10_000_000L, 0),
+                wallet.funded(1_000_000L, 1)
             ),
             amountSats = 50_000L,
             explicit = true
         )
-        assertEquals(setOf(txid(1), txid(2)), inputTxids(tx))
+        assertEquals(setOf(wallet.funded(10_000_000L, 0).utxo.txHash, wallet.funded(1_000_000L, 1).utxo.txHash), inputTxids(tx))
     }
 
     @Test
     fun explicitSelectionOfTheSmallerCoinIsNotWidened() {
         val tx = compose(
-            utxos = listOf(wallet.utxo(1_000_000L, 1, txid(3))),
+            utxos = listOf(wallet.funded(1_000_000L, 1)),
             amountSats = 50_000L,
             explicit = true
         )
-        assertEquals(setOf(txid(3)), inputTxids(tx))
+        assertEquals(setOf(wallet.funded(1_000_000L, 1).utxo.txHash), inputTxids(tx))
     }
 
     @Test
     fun explicitSpendAllOfPinnedCoinsHasOneOutput() {
         val pinned = listOf(
-            wallet.utxo(600_000L, 0, txid(4)),
-            wallet.utxo(400_000L, 1, txid(5))
+            wallet.funded(600_000L, 0),
+            wallet.funded(400_000L, 1)
         )
         val tx = compose(utxos = pinned, amountSats = 1_000_000L, explicit = true)
-        assertEquals(setOf(txid(4), txid(5)), inputTxids(tx))
+        assertEquals(setOf(wallet.funded(600_000L, 0).utxo.txHash, wallet.funded(400_000L, 1).utxo.txHash), inputTxids(tx))
         assertEquals(1, tx.outputs.size)
     }
 
     @Test
     fun pinnedCoinsBelowTheAmountAreReportedInsufficient() {
-        expectInsufficient(listOf(wallet.utxo(30_000L, 0, txid(6))), amountSats = 40_000L)
+        expectInsufficient(listOf(wallet.funded(30_000L, 0)), amountSats = 40_000L)
     }
 
     @Test
     fun pinnedCoinsCoveringAmountButNotFeeAreReportedInsufficient() {
         // 30_000 pinned, 29_900 asked: the fee does not fit, and the auto
         // passes are not allowed to reach for another coin.
-        expectInsufficient(listOf(wallet.utxo(30_000L, 0, txid(7))), amountSats = 29_900L)
+        expectInsufficient(listOf(wallet.funded(30_000L, 0)), amountSats = 29_900L)
     }
 
     @Test
     fun pinnedCoinFromAnotherAccountIsRefused() {
-        val foreign = wallet.utxo(1_000_000L, 0, txid(8)).copy(pubKey = "not-this-account")
+        val foreign = wallet.funded(1_000_000L, 0).utxo.copy(pubKey = "not-this-account")
         val composer = composer()
         runBlocking {
             withTimeout(20_000) {
@@ -145,7 +154,7 @@ class ExplicitSelectionComposeTest {
         }
     }
 
-    private fun expectInsufficient(utxos: List<Utxo>, amountSats: Long) {
+    private fun expectInsufficient(utxos: List<FundedUtxo>, amountSats: Long) {
         val composer = composer()
         runBlocking {
             withTimeout(20_000) {
@@ -154,7 +163,7 @@ class ExplicitSelectionComposeTest {
                 val fee = async { composer.getMinerFee().receive() }
                 try {
                     composer.compose(
-                        inputUtxos = ArrayList(utxos),
+                        inputUtxos = ArrayList(utxos.map { it.utxo }),
                         inputAddress = wallet.externalAddress,
                         inputFee = 1000L,
                         inputAmount = amountSats.toDouble(),
@@ -162,7 +171,7 @@ class ExplicitSelectionComposeTest {
                     )
                     fail("expected InsufficientSelectionException")
                 } catch (e: TransactionComposer.InsufficientSelectionException) {
-                    assertEquals(utxos.sumOf { it.value!! }, e.selectedSats)
+                    assertEquals(utxos.sumOf { it.utxo.value!! }, e.selectedSats)
                     assertTrue(e.requiredSats > e.selectedSats)
                 } finally {
                     fee.cancel()
@@ -173,13 +182,13 @@ class ExplicitSelectionComposeTest {
 
     private fun composer() = TransactionComposer().apply { setPubKey(listOf(wallet.pub)) }
 
-    private fun compose(utxos: List<Utxo>, amountSats: Long, explicit: Boolean): Transaction {
+    private fun compose(utxos: List<FundedUtxo>, amountSats: Long, explicit: Boolean): Transaction {
         val composer = composer()
         val bytes = runBlocking {
             withTimeout(20_000) {
                 val fee = async { composer.getMinerFee().receive() }
                 val ok = composer.compose(
-                    inputUtxos = ArrayList(utxos),
+                    inputUtxos = ArrayList(utxos.map { it.utxo }),
                     inputAddress = wallet.externalAddress,
                     inputFee = 1000L,
                     inputAmount = amountSats.toDouble(),
@@ -223,6 +232,10 @@ class ExplicitSelectionComposeTest {
         }
     }
 
+    /** #469: the Utxo plus the funding-tx hex the fake Dojo serves. */
+    private class FundedUtxo(val utxo: Utxo, val hex: String)
+
+
     private class Wallet(val params: NetworkParameters) {
         val zpub: String
         val externalAddress: String
@@ -259,21 +272,32 @@ class ExplicitSelectionComposeTest {
             )
         }
 
-        fun utxo(value: Long, index: Int, txid: String): Utxo {
+        fun funded(value: Long, index: Int): FundedUtxo {
             val account = HD_Account(params, zpub, "", 0)
             val key = account.getChain(0).getAddressAt(index).ecKey
             val address = SegwitAddress(key.pubKey, params).bech32AsString
             val script = Bech32UtilGeneric.getInstance().computeScriptPubKey(address, params)
-            return Utxo(
-                idx = txid,
-                addr = address,
-                confirmations = 1,
-                script = Hex.toHexString(script),
-                txHash = txid,
-                txOutputN = 0,
-                value = value,
-                path = "m/0/$index",
-                pubKey = zpub
+            // #469: compose() verifies every input against the prev tx it fetches,
+            // so the fixture txid is the real id of a real funding tx paying this
+            // exact output; the fake Dojo below serves that hex by txid.
+            val funding = Transaction(params)
+            funding.addOutput(TransactionOutput(params, funding, Coin.valueOf(value), script))
+            val hex = Hex.toHexString(funding.bitcoinSerialize())
+            val txid = funding.hash.toString()
+            served[txid] = hex
+            return FundedUtxo(
+                Utxo(
+                    idx = txid,
+                    addr = address,
+                    confirmations = 1,
+                    script = Hex.toHexString(script),
+                    txHash = txid,
+                    txOutputN = 0,
+                    value = value,
+                    path = "m/0/$index",
+                    pubKey = zpub
+                ),
+                hex
             )
         }
     }
@@ -282,19 +306,47 @@ class ExplicitSelectionComposeTest {
         @Volatile
         private var startedKoin = false
 
-        private fun txid(n: Int): String = "%064x".format(n)
+        private lateinit var server: MockWebServer
 
-        private fun ensureRuntime() {
+        private val served = HashMap<String, String>()
+
+        private var oneShot: MockResponse? = null
+
+        private fun serverUrl(): String = server.url("/").toString()
+
+        private fun installDispatcher() {
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    oneShot?.let {
+                        oneShot = null
+                        return it
+                    }
+                    val txid = request.path!!.substringAfter("/tx/").removeSuffix("/HEX")
+                    val hex = served[txid]
+                        ?: return MockResponse().setResponseCode(404)
+                            .setBody("""{"status":"error"}""")
+                    return MockResponse()
+                        .setBody("""{"status":"ok","data":"$hex"}""")
+                }
+            }
+        }
+
+
+        private fun ensureRuntime(baseUrl: String) {
             if (GlobalContext.getOrNull() == null) {
                 val app = ApplicationProvider.getApplicationContext<Application>()
                 val prefs = PrefsUtil(app)
                 prefs.testnet = false
+                prefs.apiEndPoint = baseUrl
                 startKoin {
                     androidContext(app)
                     modules(
                         module {
                             single { prefs }
                             single { CollectionRepository() }
+                            // #469: compose() fetches the prev tx for every input;
+                            // this single serves it from the class-level fake Dojo.
+                            single { ApiService() }
                         }
                     )
                 }
@@ -305,12 +357,23 @@ class ExplicitSelectionComposeTest {
         }
 
         @JvmStatic
+        @BeforeClass
+        fun setUpClass() {
+            server = MockWebServer()
+            server.start(InetAddress.getByName("127.0.0.1"), 0)
+            installDispatcher()
+        }
+
+        @JvmStatic
         @AfterClass
         fun tearDownClass() {
             if (startedKoin) {
                 stopKoin()
                 startedKoin = false
             }
+            server.shutdown()
+            served.clear()
+            oneShot = null
         }
     }
 }
