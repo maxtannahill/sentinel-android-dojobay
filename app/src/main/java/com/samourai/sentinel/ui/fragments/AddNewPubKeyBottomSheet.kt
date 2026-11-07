@@ -578,7 +578,10 @@ class ScanPubKeyFragment : Fragment() {
         }
     }
 
-    /** Stops the camera once a label import has consumed the scan. */
+    /**
+     * Stops the camera once a label import has consumed the scan, or
+     * while a BBQr conflict dialog is up.
+     */
     fun stopScanner() {
         if (::mCodeScanner.isInitialized && mCodeScanner.isScannerRunning()) {
             mCodeScanner.stopScanner()

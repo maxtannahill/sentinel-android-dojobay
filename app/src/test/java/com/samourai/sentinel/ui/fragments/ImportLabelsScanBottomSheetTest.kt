@@ -21,6 +21,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.StringReader
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
@@ -374,7 +375,9 @@ class ImportLabelsScanBottomSheetTest {
             scan(a0, session)
         )
 
-        // A different six-character signature still replaces the locked series.
+        // Accumulator only. A different six-character signature still
+        // replaces the locked series. The sheet gate ignores that frame
+        // while the conflict dialog is up.
         val locked = BbqrAccumulator()
         assertEquals(LabelScanAction.Collecting(BbqrProgress(1, 2)), scan(a0, locked))
         assertTrue(scan(b0, locked) is LabelScanAction.Restart)
@@ -384,6 +387,92 @@ class ImportLabelsScanBottomSheetTest {
             LabelScanAction.Import(text, BbqrProgress(1, 1)),
             scan(frame, locked)
         )
+    }
+
+    @Test
+    fun conflictDialogGatesReceivesUntilRestart() {
+        val line0 = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"one\"}\n"
+        val line1 = "{\"type\":\"tx\",\"ref\":\"bb\",\"label\":\"two\"}\n"
+        val other0 = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"OTHER\"}\n"
+        val a0 = bbqrHeader('H', 'U', 2, 0) + hexEncode(line0)
+        val a1 = bbqrHeader('H', 'U', 2, 1) + hexEncode(line1)
+        val b0 = bbqrHeader('H', 'U', 2, 0) + hexEncode(other0)
+        val text = "{\"type\":\"tx\",\"ref\":\"aa\",\"label\":\"hi\"}"
+        val otherSeries = encodeBbqr(
+            text.toByteArray(StandardCharsets.UTF_8),
+            'H',
+            parts = 1
+        ).single()
+        assertFalse(otherSeries.startsWith(a0.take(6)))
+
+        val gate = LabelScanGate()
+        assertFalse(gate.conflictDialogShowing())
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 2)),
+            gate.receive(a0)
+        )
+        val during = gate.bbqr.seriesId()
+        assertEquals(
+            LabelScanAction.Restart(BBQR_CONFLICT_MESSAGE, partIndex = 0),
+            gate.receive(b0)
+        )
+        assertTrue(gate.conflictDialogShowing())
+        assertEquals(during, gate.bbqr.seriesId())
+        assertEquals(BbqrProgress(0, 2), gate.bbqr.progress())
+        assertTrue(gate.bbqr.missingIndexes().isEmpty())
+
+        // Same signature, the disagreeing part, a one-part export with a
+        // different signature, plain JSONL, and a UR frame are all ignored.
+        assertNull(gate.receive(a0))
+        assertNull(gate.receive(a1))
+        assertNull(gate.receive(b0))
+        assertNull(gate.receive(otherSeries))
+        assertNull(gate.receive(text))
+        assertNull(gate.receive("UR:BYTES/1-2/ABCDEF"))
+        assertEquals(during, gate.bbqr.seriesId())
+        assertEquals(BbqrProgress(0, 2), gate.bbqr.progress())
+        assertTrue(gate.bbqr.missingIndexes().isEmpty())
+
+        // The accumulator on its own would still open that other series.
+        val unlocked = BbqrAccumulator()
+        assertEquals(LabelScanAction.Collecting(BbqrProgress(1, 2)), scan(a0, unlocked))
+        assertTrue(scan(b0, unlocked) is LabelScanAction.Restart)
+        assertEquals(
+            LabelScanAction.Import(text, BbqrProgress(1, 1)),
+            scan(otherSeries, unlocked)
+        )
+
+        gate.restart()
+        assertFalse(gate.conflictDialogShowing())
+        assertTrue(gate.bbqr.seriesId() != during)
+        assertEquals(
+            LabelScanAction.Collecting(BbqrProgress(1, 2)),
+            gate.receive(a0)
+        )
+        assertEquals(
+            LabelScanAction.Import(line0 + line1, BbqrProgress(2, 2)),
+            gate.receive(a1)
+        )
+        // The import consumed the scan. Another signature cannot finish behind it.
+        assertNull(gate.receive(otherSeries))
+    }
+
+    @Test
+    fun sheetStopsScannerWhileConflictDialogIsUp() {
+        val sheet = source(
+            "app/src/main/java/com/samourai/sentinel/ui/fragments/ImportLabelsScanBottomSheet.kt"
+        )
+        val listener = sheet.substringAfter("setOnScanListener").substringBefore("setURPayloadDecoder")
+        assertTrue(listener.contains("receiveLabelFrame(payload, labelGate)"))
+        val restartArm = sheet.substringAfter("is LabelScanAction.Restart ->")
+            .substringBefore("LabelScanAction.IgnoreAndResume")
+        assertTrue(restartArm.contains("stopScanner()"))
+        assertTrue(restartArm.contains("showConflictDialog()"))
+        val startOver = sheet.substringAfter("fun restartBbqrScan()")
+            .substringBefore("fun labelsFromUR")
+        assertTrue(startOver.contains("labelGate.restart()"))
+        assertTrue(startOver.contains("resumeScan()"))
+        assertTrue(startOver.contains("bbqrGeneration += 1"))
     }
 
     @Test
@@ -812,6 +901,16 @@ class ImportLabelsScanBottomSheetTest {
         payload: String,
         session: BbqrAccumulator = BbqrAccumulator(),
     ): LabelScanAction = labelScanAction(payload, session)
+
+    private fun source(relative: String): String {
+        val file = sequenceOf(
+            File(relative),
+            File(relative.removePrefix("app/")),
+            File("../$relative"),
+        ).firstOrNull { it.isFile }
+            ?: error("missing $relative from ${File(".").absolutePath}")
+        return file.readText()
+    }
 
     private fun importFresh(text: String): ImportResult = runBlocking {
         freshImporter().import(BufferedReader(StringReader(text)), "mainnet", 1000L)

@@ -29,10 +29,9 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
 
     private var onLabelsDecoded: ((String) -> Unit)? = null
     private val scanFragment = ScanPubKeyFragment()
-    private val bbqrLabels = BbqrAccumulator()
+    private val labelGate = LabelScanGate()
     private val bbqrGate = Mutex()
     private var bbqrGeneration = 0
-    private var importConsumed = false
     private var conflictDialog: Dialog? = null
 
     fun setOnLabelsDecodedListener(callback: (String) -> Unit) {
@@ -55,20 +54,17 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
         }
         scanFragment.setOnScanListener { payload ->
             // Join, inflate, and the label check run off this callback.
-            // The callback itself stays on the camera main thread, so it
-            // only schedules the work and keeps the camera running until
-            // an import actually consumes the scan.
+            // The callback stays on the camera thread and only schedules
+            // the work. The camera runs until an import consumes the scan,
+            // and it stays stopped while the BBQr conflict dialog is up.
             val generation = bbqrGeneration
             viewLifecycleOwner.lifecycleScope.launch {
                 val action = try {
                     bbqrGate.withLock {
-                        if (generation != bbqrGeneration || importConsumed) return@withLock null
-                        val action = runLabelFrame(payload, bbqrLabels) {
+                        if (generation != bbqrGeneration) return@withLock null
+                        receiveLabelFrame(payload, labelGate) {
                             this@launch.isActive && generation == bbqrGeneration
                         }
-                        if (generation != bbqrGeneration) return@withLock null
-                        if (action is LabelScanAction.Import) importConsumed = true
-                        action
                     }
                 } catch (abandoned: BbqrAbandoned) {
                     if (!isActive) throw CancellationException("BBQr")
@@ -101,7 +97,7 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
 
     /** Missing indexes for the next QRPerf line. Does not move accepted/expected. */
     private fun noteBbqrWatch() {
-        QrPerf.noteBbqrMissing(bbqrLabels.missingIndexes(), bbqrLabels.seriesId())
+        QrPerf.noteBbqrMissing(labelGate.bbqr.missingIndexes(), labelGate.bbqr.seriesId())
     }
 
     /**
@@ -155,8 +151,9 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
                         partIndex = action.partIndex,
                     )
                 )
-                noteBbqrProgress(bbqrLabels.progress())
+                noteBbqrProgress(labelGate.bbqr.progress())
                 noteBbqrWatch()
+                scanFragment.stopScanner()
                 showConflictDialog()
             }
             LabelScanAction.IgnoreAndResume -> Unit
@@ -176,7 +173,7 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
             .show()
     }
 
-    /** Drops the mixed series so the same export can be scanned again. */
+    /** Drops the mixed series and resumes the camera so the export can be scanned again. */
     private fun restartBbqrScan() {
         bbqrGeneration += 1
         conflictDialog?.dismiss()
@@ -184,10 +181,11 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
         val owner = viewLifecycleOwnerLiveData.value ?: return
         owner.lifecycleScope.launch {
             bbqrGate.withLock {
-                bbqrLabels.reset()
+                labelGate.restart()
             }
-            QrPerf.noteBbqrMissing(emptyList(), bbqrLabels.seriesId())
+            QrPerf.noteBbqrMissing(emptyList(), labelGate.bbqr.seriesId())
             scanFragment.clearPartCount()
+            scanFragment.resumeScan()
         }
     }
 
@@ -197,6 +195,50 @@ class ImportLabelsScanBottomSheet : BottomSheetDialogFragment() {
             String(result.ur.decodeFromRegistry() as ByteArray, StandardCharsets.UTF_8)
         }.getOrElse { return null }
         return if (isValidLabelsJsonl(text)) text else null
+    }
+}
+
+/**
+ * Ignores label QR frames while the BBQr conflict dialog is up.
+ *
+ * [BbqrAccumulator] still starts a new series when the six-character
+ * signature changes, including after a conflict. This gate is what
+ * stops that from running behind the dialog: [receive] returns null
+ * until [restart], which is Start over. An import closes it too, so a
+ * second frame cannot complete another import.
+ */
+internal class LabelScanGate(
+    val bbqr: BbqrAccumulator = BbqrAccumulator(),
+) {
+    private var dialogShowing: Boolean = false
+    private var importConsumed: Boolean = false
+
+    fun conflictDialogShowing(): Boolean = dialogShowing
+
+    /**
+     * One label QR, or null when the conflict dialog is up or an import
+     * already consumed the scan. A [LabelScanAction.Restart] raises the
+     * dialog gate.
+     */
+    fun receive(payload: String, isActive: () -> Boolean = { true }): LabelScanAction? {
+        if (dialogShowing || importConsumed) return null
+        val action = labelScanAction(payload, bbqr, isActive)
+        when (action) {
+            is LabelScanAction.Import -> importConsumed = true
+            is LabelScanAction.Restart -> dialogShowing = true
+            is LabelScanAction.Collecting,
+            is LabelScanAction.Skipped,
+            is LabelScanAction.Notify,
+            LabelScanAction.IgnoreAndResume -> Unit
+        }
+        return action
+    }
+
+    /** Start over. Drops the mixed series and admits frames again. */
+    fun restart() {
+        dialogShowing = false
+        importConsumed = false
+        bbqr.reset()
     }
 }
 
@@ -274,6 +316,19 @@ internal suspend fun runLabelFrame(
     isActive: () -> Boolean = { true },
 ): LabelScanAction = withContext(worker) {
     labelScanAction(payload, bbqr, isActive)
+}
+
+/**
+ * [LabelScanGate.receive] off the camera thread. Null while the BBQr
+ * conflict dialog is up, and after an import consumed the scan.
+ */
+internal suspend fun receiveLabelFrame(
+    payload: String,
+    gate: LabelScanGate,
+    worker: CoroutineDispatcher = Dispatchers.Default,
+    isActive: () -> Boolean = { true },
+): LabelScanAction? = withContext(worker) {
+    gate.receive(payload, isActive)
 }
 
 fun labelScanAction(

@@ -166,7 +166,10 @@ private sealed class DecodedBody {
  *
  * A decodable frame whose first six characters differ from the series in
  * progress starts a new series, so a second export can be scanned without
- * leaving the sheet. This accumulator is only fed frames the plain-QR callback
+ * leaving the sheet. That includes a series locked by a conflict. Import
+ * Labels does not feed frames while its conflict dialog is up, so the
+ * replacement cannot import behind the dialog.
+ * This accumulator is only fed frames the plain-QR callback
  * delivers. Once a UR session has started, [com.invertedx.hummingbird.QRScanner]
  * drops non-UR frames, BBQr included, and that split stays in the scanner.
  */
@@ -206,6 +209,7 @@ class BbqrAccumulator {
     /**
      * Drops the series so the same export can be scanned from the start.
      * A conflict stays put until this runs or a different signature arrives.
+     * The label sheet does not deliver that signature until Start over.
      */
     fun reset() {
         signature = null
