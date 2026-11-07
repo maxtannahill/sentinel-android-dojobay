@@ -114,19 +114,19 @@
         <Preference
             app:icon="@drawable/ic_file_export"
             app:key="exportLabels"
-            app:summary="Export wallet labels as a BIP-329 JSONL file"
+            app:summary="Export wallet labels as a BIP-329 JSONL file (Ashigaru Desktop, Sparrow, and other BIP-329 wallets)"
             app:title="Export Labels" />
 
         <Preference
             app:icon="@drawable/ic_file_import"
             app:key="importLabels"
-            app:summary="Import wallet labels from a BIP-329 JSONL file (Sparrow-compatible)"
+            app:summary="Import wallet labels from a BIP-329 JSONL file (Ashigaru Desktop, Sparrow, and other BIP-329 wallets)"
             app:title="Import Labels" />
 
         <Preference
             app:icon="@drawable/ic_baseline_qr_code_scanner_24"
             app:key="importLabelsQr"
-            app:summary="Import wallet labels by scanning an animated UR (Sparrow BIP-329 export)"
+            app:summary="Import wallet labels by scanning a BIP-329 export as animated UR or BBQr"
             app:title="Import Labels (QR)" />
 
     </PreferenceCategory>
