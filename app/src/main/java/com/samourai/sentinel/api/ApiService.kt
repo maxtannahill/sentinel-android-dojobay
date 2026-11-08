@@ -17,6 +17,7 @@ import com.samourai.sentinel.util.apiScope
 import com.samourai.wallet.api.backend.beans.UnspentOutput
 import com.samourai.wallet.api.backend.beans.WalletResponse
 import com.samourai.wallet.util.XPUB
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -45,6 +46,14 @@ open class ApiService {
     private val dojoUtility: DojoUtility by inject(DojoUtility::class.java);
     private var ACCESS_TOKEN: String? = null
     private val ACCESS_TOKEN_REFRESH = 300L
+
+    /**
+     * One in-flight [refreshDojoAuth] for this service. A pull-to-refresh
+     * fans out several Dojo calls; each 401 used to run its own refresh
+     * and then its own login (#470).
+     */
+    private val refreshLock = Any()
+    private var refreshInFlight: CompletableDeferred<Boolean>? = null
     lateinit var client: OkHttpClient
     private val  JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     private val HARDENED = 2147483648
@@ -115,8 +124,49 @@ open class ApiService {
      *
      * Deliberately blocking: [TokenAuthenticator] runs on an OkHttp thread and
      * must have a valid token before it can return the retried request.
+     *
+     * Callers that arrive while a refresh is already running wait for it.
+     * They then retry with the token that attempt stored, or fail with it,
+     * instead of each posting another /auth/refresh and /auth/login.
      */
-    suspend fun refreshDojoAuth(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun refreshDojoAuth(): Boolean {
+        val claim = claimRefreshFlight()
+        if (!claim.leader) {
+            return claim.flight.await()
+        }
+        return try {
+            val result = withContext(Dispatchers.IO) { performDojoRefresh() }
+            claim.flight.complete(result)
+            result
+        } catch (t: Throwable) {
+            claim.flight.completeExceptionally(t)
+            throw t
+        } finally {
+            synchronized(refreshLock) {
+                if (refreshInFlight === claim.flight) {
+                    refreshInFlight = null
+                }
+            }
+        }
+    }
+
+    private fun claimRefreshFlight(): RefreshClaim = synchronized(refreshLock) {
+        val existing = refreshInFlight
+        if (existing != null) {
+            RefreshClaim(leader = false, flight = existing)
+        } else {
+            val created = CompletableDeferred<Boolean>()
+            refreshInFlight = created
+            RefreshClaim(leader = true, flight = created)
+        }
+    }
+
+    private data class RefreshClaim(
+        val leader: Boolean,
+        val flight: CompletableDeferred<Boolean>,
+    )
+
+    private suspend fun performDojoRefresh(): Boolean {
         // 1. Preferred: exchange the refresh token.
         val refreshToken = prefsUtil.refreshToken
         if (!refreshToken.isNullOrEmpty()) {
@@ -126,7 +176,7 @@ open class ApiService {
                 if (response.isSuccessful && body != null && body.contains("authorizations")) {
                     dojoUtility.setAuthToken(body)
                     Timber.i("Dojo token refreshed via /auth/refresh")
-                    return@withContext true
+                    return true
                 }
                 Timber.w("Dojo /auth/refresh rejected (code ${response.code}); trying API key")
             } catch (e: Exception) {
@@ -138,7 +188,7 @@ open class ApiService {
         val apiKey = dojoUtility.getApiKey()
         if (apiKey.isNullOrEmpty()) {
             Timber.e("Cannot re-authenticate with Dojo: no refresh token and no API key")
-            return@withContext false
+            return false
         }
 
         try {
@@ -147,13 +197,13 @@ open class ApiService {
             if (response.isSuccessful && body != null && body.contains("authorizations")) {
                 dojoUtility.setAuthToken(body)
                 Timber.i("Dojo token refreshed via /auth/login")
-                return@withContext true
+                return true
             }
             Timber.e("Dojo /auth/login rejected (code ${response.code})")
-            return@withContext false
+            return false
         } catch (e: Exception) {
             Timber.e(e, "Dojo /auth/login failed")
-            return@withContext false
+            return false
         }
     }
 
@@ -350,8 +400,10 @@ open class ApiService {
         // client turns a rejected /auth/login into another login. Each
         // nested call is a new OkHttp chain, so the prior-response retry
         // cap never fires and each level blocks a dispatcher thread.
-        // /auth/refresh already passes excludeAuthenticator.
-        buildClient(excludeAuthenticator = true)
+        // excludeApiKey: the access token on this call is the one that
+        // just failed. Sending it as `at` makes the login carry a stale
+        // credential. /auth/refresh already passes both flags.
+        buildClient(excludeApiKey = true, excludeAuthenticator = true)
         val formBody = FormBody.Builder()
             .add("apikey", apiKey)
             .build()
