@@ -146,8 +146,20 @@ class CollectionEditActivity : SentinelActivity() {
                     binding.addNewPubFab.visibility = View.GONE
                 // Check if any new Public key is passed through intent
                 // we will set last item as editable so the new Public key  will be shown in edit layout
-                if (intent.extras!!.containsKey("pubKey")) {
-                    val newPubKey = intent.extras!!.getParcelable<PubKeyModel>("pubKey")
+                if (intent.extras!!.containsKey(EXTRA_PUBKEY_TOKEN)) {
+                    // #484: only an opaque single-use token rides the Intent;
+                    // the PubKeyModel comes from the process-local PubKeyRequests.
+                    val newPubKey = PubKeyRequests.take(intent.extras?.getString(EXTRA_PUBKEY_TOKEN))?.pubKeyModel
+                    if (newPubKey == null) {
+                        // Spent token (activity recreated after process death)
+                        // or stale Intent: degrade to the no-key view instead
+                        // of crashing - the key can simply be added again.
+                        viewModel.setPubKeys(model.pubs)
+                        if (model.pubs.isNotEmpty()) {
+                            pubKeyAdapter.setEditingPubKey(model.pubs[model.pubs.lastIndex].pubKey)
+                        }
+                        return
+                    }
 
                     if (newPubKey?.pubKey?.let { model.getPubKey(it) } != null) {
                         this@CollectionEditActivity.showFloatingSnackBar(
@@ -187,12 +199,17 @@ class CollectionEditActivity : SentinelActivity() {
             collectionModel.balance = 0
             collectionModel.collectionLabel = binding.collectionEdiText.text.toString()
             viewModel.setCollection(collectionModel)
-            if (intent.extras!!.containsKey("pubKey")) {
-                val newPubKey = intent.extras!!.getParcelable<PubKeyModel>("pubKey")
-                edit(newPubKey!!, 0)
-                needCollectionRefresh = true
-                viewModel.setPubKeys(arrayListOf(newPubKey!!))
-                importWalletIfSegwit(newPubKey)
+            if (intent.extras!!.containsKey(EXTRA_PUBKEY_TOKEN)) {
+                // #484: token handoff - see the collection branch above. A
+                // spent or missing token leaves the VM empty, same as the
+                // no-extra baseline.
+                val newPubKey = PubKeyRequests.take(intent.extras?.getString(EXTRA_PUBKEY_TOKEN))?.pubKeyModel
+                if (newPubKey != null) {
+                    edit(newPubKey, 0)
+                    needCollectionRefresh = true
+                    viewModel.setPubKeys(arrayListOf(newPubKey))
+                    importWalletIfSegwit(newPubKey)
+                }
             }
         }
 
@@ -540,5 +557,11 @@ class CollectionEditActivity : SentinelActivity() {
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menuInflater.inflate(R.menu.collection_details_menu, menu)
         return super.onCreateOptionsMenu(menu)
+    }
+
+    companion object {
+        /** #484: the only pub-key extra this screen reads - an opaque token. */
+        const val EXTRA_PUBKEY_TOKEN =
+            "com.samourai.sentinel.ui.collectionEdit.CollectionEditActivity.PUBKEY_REQUEST"
     }
 }

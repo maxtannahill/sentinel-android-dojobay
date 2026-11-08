@@ -30,6 +30,7 @@ import com.samourai.sentinel.databinding.FragmentBottomsheetViewPagerBinding
 import com.samourai.sentinel.ui.SentinelActivity
 import com.samourai.sentinel.ui.adapters.CollectionsAdapter
 import com.samourai.sentinel.ui.collectionEdit.CollectionEditActivity
+import com.samourai.sentinel.ui.collectionEdit.PubKeyRequests
 import com.samourai.sentinel.ui.home.HomeActivity
 import com.samourai.sentinel.ui.tools.sweep.SweepPrivKeyFragment
 import com.samourai.sentinel.ui.utils.AndroidUtil
@@ -148,7 +149,10 @@ class AddNewPubKeyBottomSheet : GenericBottomSheet {
                 return@setOnSelectListener
             }
             startActivity(Intent(context, CollectionEditActivity::class.java).apply {
-                this.putExtra("pubKey", pubKeyModel)
+                this.putExtra(
+                    CollectionEditActivity.EXTRA_PUBKEY_TOKEN,
+                    pubKeyModel?.let { PubKeyRequests.put(it) }
+                )
                 if (selectedCollection != null) {
                     this.putExtra("editIndex", collectionRepository.findById(selectedCollection.id)?.pubs?.size!!)
                     this.putExtra("collection", selectedCollection.id)
@@ -275,7 +279,10 @@ class AddNewPubKeyBottomSheet : GenericBottomSheet {
         }
         if (selectedPubKeyCollection != null) {
             startActivity(Intent(context, CollectionEditActivity::class.java).apply {
-                this.putExtra("pubKey", pubKeyModel)
+                this.putExtra(
+                    CollectionEditActivity.EXTRA_PUBKEY_TOKEN,
+                    pubKeyModel?.let { PubKeyRequests.put(it) }
+                )
                 this.putExtra("collection", selectedPubKeyCollection?.id)
             })
             this.dismiss()
