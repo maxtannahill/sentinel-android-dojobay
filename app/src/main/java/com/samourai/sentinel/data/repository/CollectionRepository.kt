@@ -3,6 +3,7 @@ package com.samourai.sentinel.data.repository
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import com.samourai.sentinel.data.PubKeyCollection
+import com.samourai.sentinel.data.PubKeyModel
 import com.samourai.sentinel.data.db.PayloadReadException
 import com.samourai.sentinel.data.db.SentinelCollectionStore
 import com.samourai.sentinel.util.dataBaseScope
@@ -79,6 +80,35 @@ class CollectionRepository {
             pubKeyCollections.add(pubKeyCollection)
         }
         this.sync()
+    }
+
+    /**
+     * Appends keys whose public key is not already in the collection.
+     * Keys that are already present are left as they are, including
+     * their labels and settings. The collection balance is refreshed
+     * from the key balances only when a key was actually added.
+     * Returns false when the id is unknown or nothing was added.
+     */
+    fun appendMissingKeys(collectionId: String, keys: List<PubKeyModel>): Boolean {
+        val changed = synchronized(pubKeyCollections) {
+            val collection = pubKeyCollections.find { it.id == collectionId }
+            if (collection == null) {
+                false
+            } else {
+                val present = collection.pubs.mapTo(HashSet()) { it.pubKey }
+                var added = false
+                for (key in keys) {
+                    if (present.add(key.pubKey)) {
+                        collection.pubs.add(key.copy())
+                        added = true
+                    }
+                }
+                if (added) collection.updateBalance()
+                added
+            }
+        }
+        if (changed) this.sync()
+        return changed
     }
 
     fun delete(index: Int) {

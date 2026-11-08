@@ -210,8 +210,20 @@ class ExportImportUtil {
                 utxoDao.delete()
                 txDao.delete()
                 collectionRepository.reset()
+                pubKeyCollection.forEach { collectionRepository.addNew(it) }
+            } else {
+                // addNew() always assigns a new id, so appending every
+                // collection listed each one a second time. Merge against
+                // the collections already on the device instead.
+                val plan = planCollectionImport(
+                    collectionRepository.collectionsSnapshot(),
+                    pubKeyCollection,
+                )
+                for (addition in plan.keysForExisting) {
+                    collectionRepository.appendMissingKeys(addition.collectionId, addition.keys)
+                }
+                plan.collectionsToAdd.forEach { collectionRepository.addNew(it) }
             }
-            pubKeyCollection.forEach { collectionRepository.addNew(it) }
             // #48: addNew's sync() writes are fire-and-forget; without an
             // awaited final write, a restart-triggered read() could observe
             // a partial list. syncNow() drains the queued writes and lands
