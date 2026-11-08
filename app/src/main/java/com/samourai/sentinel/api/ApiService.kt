@@ -161,7 +161,9 @@ open class ApiService {
      * POST /auth/refresh - exchanges a refresh token for a new access token.
      *
      * excludeAuthenticator avoids recursing into [TokenAuthenticator] if this
-     * call itself returns 401.
+     * call itself returns 401. [authenticateDojo] does the same for
+     * /auth/login (#470). That login is the fallback in [refreshDojoAuth],
+     * so an authenticator on it calls this method again.
      */
     private suspend fun refreshDojoToken(refreshToken: String): Response {
         buildClient(excludeApiKey = true, excludeAuthenticator = true)
@@ -343,7 +345,13 @@ open class ApiService {
 
 
     suspend fun authenticateDojo(apiKey: String): Response {
-        buildClient()
+        // #470: TokenAuthenticator's recovery is refreshDojoAuth, and the
+        // fallback there is this login. An authenticator on the login
+        // client turns a rejected /auth/login into another login. Each
+        // nested call is a new OkHttp chain, so the prior-response retry
+        // cap never fires and each level blocks a dispatcher thread.
+        // /auth/refresh already passes excludeAuthenticator.
+        buildClient(excludeAuthenticator = true)
         val formBody = FormBody.Builder()
             .add("apikey", apiKey)
             .build()
