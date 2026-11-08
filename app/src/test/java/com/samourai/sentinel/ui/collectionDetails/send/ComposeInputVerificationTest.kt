@@ -336,25 +336,29 @@ class ComposeInputVerificationTest {
         }
 
         private fun ensureRuntime(baseUrl: String) {
-            if (GlobalContext.getOrNull() == null) {
-                val app = ApplicationProvider.getApplicationContext<Application>()
-                val prefs = PrefsUtil(app)
-                prefs.testnet = false
-                prefs.apiEndPoint = baseUrl
-                startKoin {
-                    androidContext(app)
-                    modules(
-                        module {
-                            single { prefs }
-                            single { CollectionRepository() }
-                            // #469: compose() fetches the prev tx for
-                            // every input; this single serves it.
-                            single { ApiService() }
-                        }
-                    )
-                }
-                startedKoin = true
+            // #469 CI (run 42426252881): another Robolectric class can leave a
+            // Koin graph running in this fork without an ApiService bean; the old
+            // start-only-when-null guard silently skipped registration and every
+            // compose test failed closed on NoBeanDefFound. Stop whatever graph is
+            // running, then always start ours.
+            GlobalContext.getOrNull()?.let { stopKoin() }
+            val app = ApplicationProvider.getApplicationContext<Application>()
+            val prefs = PrefsUtil(app)
+            prefs.testnet = false
+            prefs.apiEndPoint = baseUrl
+            startKoin {
+                androidContext(app)
+                modules(
+                    module {
+                        single { prefs }
+                        single { CollectionRepository() }
+                        // #469: compose() fetches the prev tx for
+                        // every input; this single serves it.
+                        single { ApiService() }
+                    }
+                )
             }
+            startedKoin = true
             check(!SentinelState.isTestNet()) { "fixture is a mainnet zpub" }
             shadowOf(Looper.getMainLooper()).idle()
         }
