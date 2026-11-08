@@ -62,6 +62,25 @@ import timber.log.Timber
 internal fun emptyReconcileAllowed(itemCount: Int, provenEmpty: Boolean): Boolean =
     itemCount > 0 || provenEmpty
 
+/**
+ * #475: what one fetchFromServer round proved about a collection's tx
+ * history - the sync completion gate's input. Fetched and ProvenEmpty
+ * let a round pass; Indeterminate must not ride a Success banner.
+ */
+sealed interface CollectionTxSyncResult {
+    /** Rows were fetched this round and reconciled into the table. */
+    data class Fetched(val rowCount: Int) : CollectionTxSyncResult
+
+    /** The server proved the wallet empty this round; table wiped to match. */
+    data object ProvenEmpty : CollectionTxSyncResult
+
+    /**
+     * Neither - a flaky round (#226 guard), an unresolved collection, or
+     * a dropped saveTx. Counts as a failure in the round's accounting.
+     */
+    data object Indeterminate : CollectionTxSyncResult
+}
+
 class TransactionsRepository {
 
     private val txDao: TxDao by inject(TxDao::class.java)
@@ -106,17 +125,25 @@ class TransactionsRepository {
         return txDao.getAllTx(collectionId)
     }
 
+    /** #475: stored-row count for one collection - the round completion gate's proof of history. */
+    suspend fun countTxForCollection(collectionId: String): Int =
+        txDao.countForCollection(collectionId)
+
     /**
      *  Api call for wallet api
      *  using coroutines concurrent execution
      */
     // Wrapped in withContext(Dispatchers.IO) so Room is never touched on the main
     // thread regardless of which dispatcher the caller used.
-    suspend fun fetchFromServer(collectionId: String): Unit = withContext(Dispatchers.IO) {
+    suspend fun fetchFromServer(collectionId: String): CollectionTxSyncResult = withContext(Dispatchers.IO) {
+        // #475: the round's proof for the caller's completion gate.
+        // Indeterminate until the tx reconcile below proves better;
+        // every early return and the ApiNotConfigured arm keep it.
+        var txOutcome: CollectionTxSyncResult = CollectionTxSyncResult.Indeterminate
         try {
             logThreadInfo("fetchFromServer")
             val collection = collectionRepository.findById(collectionId)
-                ?: return@withContext
+                ?: return@withContext CollectionTxSyncResult.Indeterminate
             var newTransactions: ArrayList<Tx> = arrayListOf();
             val utxos: ArrayList<Utxo> = arrayListOf();
             // #226: a fee table is the healthy-round signal. {} is the
@@ -311,7 +338,7 @@ class TransactionsRepository {
                         val collectionsSnapshot = collectionRepository.collectionsSnapshot()
                         val item =
                             collectionsSnapshot.find { collection -> collection.id == collectionId }
-                                ?: return@withContext
+                                ?: return@withContext CollectionTxSyncResult.Indeterminate
                         collectionRepository.update(
                             collection,
                             collectionsSnapshot.indexOf(item)
@@ -375,7 +402,16 @@ class TransactionsRepository {
                 if (newTransactions.isEmpty()) {
                     Timber.w("fetchFromServer: empty tx round with a fee table; wiping $collectionId")
                 }
-                saveTx(newTransactions, collectionId)
+                // #475: saveTx's findById null-drop was silent - a lying
+                // Success rode on it. Its Boolean now feeds the round
+                // completion gate.
+                txOutcome = if (!saveTx(newTransactions, collectionId)) {
+                    CollectionTxSyncResult.Indeterminate
+                } else if (newTransactions.isEmpty()) {
+                    CollectionTxSyncResult.ProvenEmpty
+                } else {
+                    CollectionTxSyncResult.Fetched(newTransactions.size)
+                }
             } else {
                 Timber.w("fetchFromServer: empty tx round without a fee table; not wiping $collectionId")
             }
@@ -511,6 +547,8 @@ class TransactionsRepository {
                     )
                 }
             }
+            // #475: the try's value - the round's proof.
+            txOutcome
         } catch (e: ApiNotConfigured) {
             // #103: ApiNotConfigured extends Throwable - every catch(Exception)
             // wall above (per-job and this outer one) is blind to it, so an async
@@ -519,6 +557,7 @@ class TransactionsRepository {
             // as fetchUTXOS below. The throw jumps from await() straight here:
             // the delete window is never reached, no partial wipe.
             Timber.e(e)
+            txOutcome
         } catch (e: Exception) {
             Timber.e(e)
             throw e
@@ -565,10 +604,11 @@ class TransactionsRepository {
     // launch could still be inserting after the sync returned).
     // #87 parity with saveUtxos: a collection deleted mid-sync
     // reconciles to nothing instead of resurrecting rows.
-    private suspend fun saveTx(transactions: ArrayList<Tx>, collectionId: String) {
+    private suspend fun saveTx(transactions: ArrayList<Tx>, collectionId: String): Boolean {
         val collection = collectionRepository.findById(collectionId)
-            ?: return
+            ?: return false
         txDao.upsertCollectionTx(collectionId, transactions)
+        return true
     }
 
 
@@ -614,7 +654,7 @@ class TransactionsRepository {
         }
     }
 
-    suspend fun fetchFromServer(collection: PubKeyCollection) {
+    suspend fun fetchFromServer(collection: PubKeyCollection): CollectionTxSyncResult {
         return this.fetchFromServer(collection.id)
     }
 

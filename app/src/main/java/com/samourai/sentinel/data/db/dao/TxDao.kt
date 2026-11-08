@@ -49,6 +49,14 @@ interface TxDao {
     @Query("SELECT COUNT(*) FROM transactions WHERE collectionId=:collectionId AND associatedPubKey=:pubKey")
     suspend fun countForPub(collectionId: String, pubKey: String): Int
 
+    /**
+     * #475: rows stored for one whole collection. The sync completion
+     * gate counts these per round - [countForPub] covers one key; this
+     * covers the collection the round just fetched for.
+     */
+    @Query("SELECT COUNT(*) FROM transactions WHERE collectionId=:collectionId")
+    suspend fun countForCollection(collectionId: String): Int
+
     @Query("SELECT * from transactions WHERE associatedPubKey=:pubKey  ORDER BY time DESC LIMIT $TX_PAGE_SIZE")
     fun getAssociated(pubKey: String): List<Tx>
 

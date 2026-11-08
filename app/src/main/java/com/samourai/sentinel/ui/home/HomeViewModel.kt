@@ -8,6 +8,7 @@ import com.samourai.sentinel.data.PubKeyCollection
 import com.samourai.sentinel.data.repository.CollectionRepository
 import com.samourai.sentinel.data.repository.ExchangeRateRepository
 import com.samourai.sentinel.data.repository.FeeRepository
+import com.samourai.sentinel.data.repository.CollectionTxSyncResult
 import com.samourai.sentinel.data.repository.TransactionsRepository
 import com.samourai.sentinel.tor.EnumTorState
 import com.samourai.sentinel.tor.SentinelTorManager
@@ -443,6 +444,10 @@ class HomeViewModel : ViewModel() {
 
         var completed = 0
         var failed = 0
+        // #475: per-round failure identity and proven-empty proof -
+        // inputs to the completion gate (gateTxHistory) below.
+        val failedIds = mutableSetOf<String>()
+        val provenEmptyIds = mutableSetOf<String>()
         // Tracked locally because postValue() is asynchronous - reading
         // syncState.value in the finally block would still see "Syncing" and
         // clobber the real terminal state.
@@ -460,11 +465,29 @@ class HomeViewModel : ViewModel() {
         try {
             collections.forEach { collection ->
                 try {
-                    transactionsRepository.fetchUTXOS(collection.id)
+                    // #475: fetchFromServer, not fetchUTXOS - the auto
+                    // round must land history, not just spendable coin.
+                    // The /wallet body already carries the newest tx page
+                    // and fetchUTXOS discarded it, which is the
+                    // imported-backup repro's root cause. One round covers
+                    // balances, fees, utxos and txs.
+                    when (transactionsRepository.fetchFromServer(collection.id)) {
+                        is CollectionTxSyncResult.Fetched -> Unit
+                        CollectionTxSyncResult.ProvenEmpty ->
+                            provenEmptyIds.add(collection.id)
+                        CollectionTxSyncResult.Indeterminate -> {
+                            failed++
+                            failedIds.add(collection.id)
+                            Timber.e(
+                                "sync round: tx history indeterminate for ${collection.id}"
+                            )
+                        }
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
                     failed++
+                    failedIds.add(collection.id)
                     Timber.e(e, "Failed to sync collection ${collection.id}")
                 }
                 completed++
@@ -477,6 +500,15 @@ class HomeViewModel : ViewModel() {
                 )
                 updateBalance()
             }
+
+            // #475 completion gate: no Success until every round-scoped
+            // collection owns rows in the tx table, a proven-empty round,
+            // or a counted failure (#226 emptyReconcileAllowed shape - a
+            // genuinely empty watch-only wallet still goes green). Gate
+            // misses degrade into the existing partial-Failed arm, so
+            // silent drops (saveTx's findById null-return) become loud
+            // incompletes instead of lying Successes.
+            failed += gateTxHistory(collections, failedIds, provenEmptyIds)
 
             updateBalance()
 
@@ -526,6 +558,35 @@ class HomeViewModel : ViewModel() {
                 syncState.postValue(SyncState.Failed("Sync interrupted.", retryable = true))
             }
         }
+    }
+
+    /**
+     * #475: the round completion gate. A collection passes when the tx
+     * table holds its rows, the round proved it empty, or its failure
+     * was already counted. Collections that pass none of the three are
+     * added to [failedIds] so the existing partial-Failed arm reports an
+     * honest incomplete instead of a Success over a history that was
+     * never fetched.
+     */
+    private suspend fun gateTxHistory(
+        collections: List<PubKeyCollection>,
+        failedIds: MutableSet<String>,
+        provenEmptyIds: Set<String>,
+    ): Int {
+        var gateFailed = 0
+        collections.forEach { collection ->
+            if (collection.id !in failedIds &&
+                collection.id !in provenEmptyIds &&
+                transactionsRepository.countTxForCollection(collection.id) == 0
+            ) {
+                failedIds.add(collection.id)
+                gateFailed++
+                Timber.e(
+                    "sync gate: no tx history for ${collection.id} after a clean round"
+                )
+            }
+        }
+        return gateFailed
     }
 
     /**
@@ -674,6 +735,17 @@ class HomeViewModel : ViewModel() {
             }
 
             if (collections.isEmpty()) {
+                // #475: the snapshot is empty because repository.read()
+                // has not landed yet (#289), not because the wallet is
+                // empty. The old Success here was the second lying
+                // completion over an unread payload - the post-import
+                // repro's exact shape. Defer instead: read()'s
+                // collectionsLiveData emission re-arms the real round
+                // through getCollections().
+                if (!repository.isPayloadLoaded()) {
+                    Timber.i("sync round deferred: payload not yet loaded")
+                    return@launch
+                }
                 // #188: the head guard checked the endpoint at admit;
                 // re-check at post time - it can vanish mid-round.
                 if (prefsUtil.isAPIEndpointEnabled()) {
@@ -688,6 +760,9 @@ class HomeViewModel : ViewModel() {
             lastRoundSignature = collectionSignature(collections)
             var completed = 0
             var failed = 0
+            // #475: gate inputs - see gateTxHistory.
+            val failedIds = mutableSetOf<String>()
+            val provenEmptyIds = mutableSetOf<String>()
             var resolved = false
             syncState.postValue(SyncState.Syncing(done = 0, total = collections.size))
 
@@ -702,11 +777,25 @@ class HomeViewModel : ViewModel() {
             try {
                 collections.forEach { collection ->
                     try {
-                        transactionsRepository.fetchFromServer(collection)
+                        // #475: same outcome accounting as the auto
+                        // round - feeds the completion gate below.
+                        when (transactionsRepository.fetchFromServer(collection)) {
+                            is CollectionTxSyncResult.Fetched -> Unit
+                            CollectionTxSyncResult.ProvenEmpty ->
+                                provenEmptyIds.add(collection.id)
+                            CollectionTxSyncResult.Indeterminate -> {
+                                failed++
+                                failedIds.add(collection.id)
+                                Timber.e(
+                                    "sync round: tx history indeterminate for ${collection.id}"
+                                )
+                            }
+                        }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
                         failed++
+                        failedIds.add(collection.id)
                         Timber.e(e)
                     }
                     completed++
@@ -718,6 +807,9 @@ class HomeViewModel : ViewModel() {
                         )
                     )
                 }
+
+                // #475 completion gate - see gateTxHistory.
+                failed += gateTxHistory(collections, failedIds, provenEmptyIds)
 
                 try {
                     feeRepository.getDynamicFees()

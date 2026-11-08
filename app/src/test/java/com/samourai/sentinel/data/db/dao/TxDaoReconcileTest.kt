@@ -201,6 +201,29 @@ class TxDaoReconcileTest {
     }
 
     /**
+     * #475: the completion gate counts WHOLE-collection rows; the per-pub
+     * shape is countForPub. A collection's rows across two pubs must not
+     * read as zero, and an unknown collection must.
+     */
+    @Test
+    fun countForCollectionSeesEveryPub() = runBlocking {
+        dao.upsertCollectionTx(
+            collection,
+            listOf(
+                tx("txa", associatedPubKey = pubKey),
+                tx("txb", associatedPubKey = "other")
+            )
+        )
+        dao.upsertCollectionTx(
+            otherCollection,
+            listOf(tx("txo", collectionId = otherCollection))
+        )
+        assertEquals(2, dao.countForCollection(collection))
+        assertEquals(1, dao.countForCollection(otherCollection))
+        assertEquals(0, dao.countForCollection("c-none"))
+    }
+
+    /**
      * #284: the keychain list reads these LiveDatas (newest first), not
      * a Paging DataSource. A pubkey tab must not leak a sibling key.
      */
