@@ -45,6 +45,8 @@ import com.samourai.sentinel.ui.utils.showFloatingSnackBar
 import com.samourai.sentinel.ui.views.KdfProgressOverlay
 import com.samourai.sentinel.ui.views.LockScreenDialog
 import com.samourai.sentinel.util.ExportImportUtil
+import com.samourai.sentinel.util.ImportLimits
+import com.samourai.sentinel.util.ImportTooLargeException
 import com.samourai.sentinel.util.PairingImportFailure
 import com.samourai.sentinel.util.PairingWords
 import com.samourai.sentinel.util.pairingImportUserMessage
@@ -60,10 +62,8 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.koin.java.KoinJavaComponent.inject
 import timber.log.Timber
-import java.io.BufferedReader
 import java.io.FileNotFoundException
 import java.io.IOException
-import java.io.InputStreamReader
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -225,11 +225,19 @@ class ImportBackUpActivity : SentinelActivity() {
         }
 
         binding.importPastePayloadBtn.setOnClickListener {
-            if (AndroidUtil.getClipBoardString(applicationContext) != null) {
-                AndroidUtil.getClipBoardString(applicationContext)?.let {
-                    binding.importPayloadTextView.text = ""
-                    validatePayload(it)
+            AndroidUtil.getClipBoardString(applicationContext)?.let {
+                binding.importPayloadTextView.text = ""
+                // #471: the file path's envelope limit applies to paste too.
+                if (it.length > ImportLimits.BACKUP_MAX_BYTES) {
+                    showFloatingSnackBar(
+                        binding.importStartBtn,
+                        text = ImportTooLargeException(
+                            ImportLimits.BACKUP_MAX_BYTES.toLong(), "characters"
+                        ).message.orEmpty()
+                    )
+                    return@let
                 }
+                validatePayload(it)
             }
         }
 
@@ -481,6 +489,22 @@ class ImportBackUpActivity : SentinelActivity() {
                         setImportBusy(false)
                         return@launch
                     }
+                    // #471: bound what a decrypted backup may write,
+                    // before any planning or write touches the wallet.
+                    val backupCollections = payload.first.orEmpty()
+                    try {
+                        ImportLimits.requireImportCounts(
+                            backupCollections.size,
+                            backupCollections.sumOf { it.pubs.size }
+                        )
+                    } catch (e: ImportTooLargeException) {
+                        setImportBusy(false)
+                        showFloatingSnackBar(
+                            binding.importPastePayloadBtn, e.message.orEmpty(),
+                            anchorView = binding.importStartBtn.id
+                        )
+                        return@launch
+                    }
 
                     // #272: the backup door's network plan, computed
                     // post-decrypt, pre-write - and pre-PIN: no point
@@ -700,6 +724,8 @@ class ImportBackUpActivity : SentinelActivity() {
                                 password
                         )
                         val pubKeys = payload.first
+                        // #471: bounded before any write.
+                        ImportLimits.requireImportCounts(1, pubKeys.size)
                         // #276: the validated dojo (decryptSentinelLegacy
                         // returns it as the pair's second) is no longer
                         // dropped at this door - it gets its leg below.
@@ -1068,16 +1094,14 @@ class ImportBackUpActivity : SentinelActivity() {
                             // #82: up to 5MB of file I/O ran on Main in
                             // the picker result; the read (size guard
                             // included) belongs on IO.
+                            // #471: available() is not the document size;
+                            // count what is read and stop at limit + 1.
                             val string = withContext(Dispatchers.IO) {
                                 val inputStream = contentResolver.openInputStream(data.data!!)
-                                val reader = BufferedReader(InputStreamReader(inputStream))
-                                val size = inputStream?.available()
-                                if (size != null) {
-                                    if (size > 5e+6) {
-                                        throw IOException("File size is too large to open")
-                                    }
+                                    ?: throw FileNotFoundException("Unable to open file")
+                                inputStream.use {
+                                    ImportLimits.readBoundedText(it, ImportLimits.BACKUP_MAX_BYTES)
                                 }
-                                reader.buffered().readText()
                             }
                             withContext(Dispatchers.Main) {
                                 validatePayload(string)

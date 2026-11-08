@@ -33,6 +33,8 @@ import com.samourai.sentinel.ui.utils.permissionResultOf
 import com.samourai.sentinel.ui.utils.shouldAdmitScan
 import com.samourai.sentinel.ui.utils.startDocumentPickerForResult
 import com.samourai.sentinel.ui.views.SuccessfulBottomSheet
+import com.samourai.sentinel.util.ImportLimits
+import com.samourai.sentinel.util.ImportTooLargeException
 import com.samourai.wallet.psbt.PSBT
 import com.sparrowwallet.hummingbird.registry.CryptoPSBT
 import com.sparrowwallet.hummingbird.registry.RegistryType
@@ -47,10 +49,7 @@ import org.bitcoinj.core.Transaction
 import org.bouncycastle.util.encoders.Hex
 import org.koin.java.KoinJavaComponent.inject
 import timber.log.Timber
-import java.io.BufferedReader
 import java.io.FileNotFoundException
-import java.io.IOException
-import java.io.InputStreamReader
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 
@@ -246,8 +245,28 @@ class BroadcastTx : SentinelActivity() {
                 "Incompatible QR format. Cannot parse transaction."
             else
                 "Incompatible format. Cannot parse transaction."
+        // #471: every entry point (file, paste, scan, intent) lands here.
+        // Bound the text before decoding and the bytes before parsing.
+        val decoded = try {
+            ImportLimits.requireTextWithin(hex, ImportLimits.TX_TEXT_MAX_CHARS)
+            Hex.decode(hex).also {
+                ImportLimits.requireBytesWithin(it, ImportLimits.TX_MAX_DECODED_BYTES)
+            }
+        } catch (tooLarge: ImportTooLargeException) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(applicationContext, tooLarge.message, Toast.LENGTH_LONG).show()
+                disableBtn(binding.broadCastTransactionBtn, false)
+            }
+            return
+        } catch (ex: Exception) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(applicationContext, errorText, Toast.LENGTH_LONG).show()
+                disableBtn(binding.broadCastTransactionBtn, false)
+            }
+            return
+        }
         try {
-            val transaction = Transaction(SentinelState.getNetworkParam(), Hex.decode(hex))
+            val transaction = Transaction(SentinelState.getNetworkParam(), decoded)
             hash = transaction.hashAsString
             withContext(Dispatchers.Main) {
                 disableAllButtons(true)
@@ -256,7 +275,7 @@ class BroadcastTx : SentinelActivity() {
             }
         } catch (ex: Exception) {
             try {
-                val psbt = PSBT.fromBytes(Hex.decode(hex), SentinelState.getNetworkParam())
+                val psbt = PSBT.fromBytes(decoded, SentinelState.getNetworkParam())
                 // #464: the payload parsed as a PSBT - that is not an
                 // incompatible format, it is the wrong artifact for this
                 // screen. Broadcast sends a raw signed transaction; the
@@ -324,16 +343,15 @@ class BroadcastTx : SentinelActivity() {
                 // The job completes with the real cause; the CEH contains any
                 // escape, and the consumer below guards genuine teardown.
                 model.viewModelScope.launch(Dispatchers.Main + fileImportHandler) {
-                    val inputStream = contentResolver.openInputStream(data.data!!)
-                    val reader = BufferedReader(InputStreamReader(inputStream))
-                    val size = inputStream?.available()
-                    if (size != null) {
-                        if (size > 5e+6) {
-                            throw  IOException("File size is too large to open")
+                    // #471: available() is not the document size; count
+                    // what is read and stop at limit + 1, off Main.
+                    val string = withContext(Dispatchers.IO) {
+                        val inputStream = contentResolver.openInputStream(data.data!!)
+                            ?: throw FileNotFoundException("Unable to open file")
+                        inputStream.use {
+                            ImportLimits.readBoundedText(it, ImportLimits.TX_TEXT_MAX_CHARS)
                         }
                     }
-                    var string = ""
-                    string = reader.buffered().readText()
                     withContext(Dispatchers.Main) {
                         validate(string)
                     }
