@@ -543,4 +543,14 @@
     -->
     <string name="collection_network_badge_paired" translatable="false">%1$s collection\nYour Dojo is on %2$s</string>
     <string name="collection_network_badge_unpaired" translatable="false">%1$s collection\nYou are on %2$s</string>
+    <!-- #472: explorer routing when Tor is required -->
+    <string name="explorer_tor_required_title">Tor is required</string>
+    <string name="explorer_tor_required_off">Your wallet requires Tor (a paired Dojo or your Tor setting), but Tor is not running. The explorer will not load without Tor, so your network address is not exposed. Start Tor, or close this screen.</string>
+    <string name="explorer_tor_required_unsupported">Your wallet requires Tor, but this device\'s WebView cannot route through Tor. The explorer will not load here, so your network address is not exposed.</string>
+    <string name="explorer_tor_route_failed_title">Couldn\'t route through Tor</string>
+    <string name="explorer_tor_route_failed">The explorer could not be routed through Tor, so it will not load. Close this screen and try again.</string>
+    <string name="explorer_proxy_unsupported_optional">This device\'s WebView cannot use Tor. Continuing will load the explorer without Tor.</string>
+    <string name="explorer_continue_without_tor">Continue without Tor</string>
+    <string name="explorer_wait_for_tor">Wait for Tor</string>
+    <string name="explorer_close">Close</string>
 </resources>
