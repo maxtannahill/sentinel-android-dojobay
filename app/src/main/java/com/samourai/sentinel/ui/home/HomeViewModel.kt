@@ -101,10 +101,19 @@ class HomeViewModel : ViewModel() {
     @Volatile
     private var lastRoundSignature: String? = null
 
-    private fun collectionSignature(list: List<PubKeyCollection>): String =
-        list.joinToString("|") { c ->
-            c.id + ":" + c.pubs.joinToString(",") { it.pubKey }
-        }
+    /**
+     * #489: signature of the input list the round in flight was armed
+     * with - the baseline the trailing re-run decision compares
+     * against. Stamped at round start (both round kinds), and
+     * deliberately NOT nulled on failure: lastRoundSignature's #287
+     * null is what lets EXTERNAL arms retry a failed round, but it
+     * also un-gated the trailing re-run - which the round itself
+     * arms ~20x through its own per-pub collectionRepository.update()
+     * emissions - so every failed round birthed the next one (idle
+     * device leg 2026-11-08: a full round every ~16s, 8 in a row).
+     */
+    @Volatile
+    private var roundStartSignature: String? = null
 
     /** Bounded auto-retry budget; reset on success or user refresh. */
     private var autoRetryBudget = 0
@@ -133,7 +142,7 @@ class HomeViewModel : ViewModel() {
             Timber.i("sync round suppressed: round in flight, trailing re-run armed")
             return
         }
-        val signature = collectionSignature(collections)
+        val signature = SyncRerunPolicy.signatureOf(collections)
         if (lastRoundSignature != null && signature == lastRoundSignature) {
             Timber.i("sync round skipped: signature unchanged since last round")
             // #184: a skipped re-arm must not leave the climb's
@@ -146,6 +155,8 @@ class HomeViewModel : ViewModel() {
             return
         }
         lastRoundSignature = signature
+        // #489: baseline for the trailing re-run decision.
+        roundStartSignature = signature
         Timber.i("sync round begin: syncCollections collections=${collections.size}")
         syncRound = viewModelScope.launch(Dispatchers.IO) {
             val self = coroutineContext[Job]
@@ -593,11 +604,21 @@ class HomeViewModel : ViewModel() {
      * Trailing re-run with id-diff discipline: the finished round already
      * synced exactly these collections if the id sets match, so its own
      * emissions are discarded. Only a genuinely changed list re-arms (#47).
+     *
+     * #489: the unchanged-list gate lives HERE now, on the round's START
+     * signature - not on lastRoundSignature, which a failed round nulls
+     * (#287, so external arms can still retry) and which therefore could
+     * never stop this re-run while the round's own emission storm had it
+     * armed. A null baseline fails open: fresh boot, or a round that
+     * deferred before stamping (Tor climb, payload not yet loaded).
      */
     private fun maybeTrailingRerun() {
-        // launchSyncRound applies the signature gate; an unchanged list is
-        // skipped there (#47).
-        repository.collectionsLiveData.value?.let { launchSyncRound(it) }
+        val current = repository.collectionsLiveData.value ?: return
+        if (!SyncRerunPolicy.shouldRerun(roundStartSignature, current)) {
+            Timber.i("sync re-run skipped: list unchanged since round start")
+            return
+        }
+        launchSyncRound(current)
     }
 
     fun getBalance(): LiveData<Long> {
@@ -757,7 +778,9 @@ class HomeViewModel : ViewModel() {
                 return@launch
             }
 
-            lastRoundSignature = collectionSignature(collections)
+            lastRoundSignature = SyncRerunPolicy.signatureOf(collections)
+            // #489: baseline for the trailing re-run decision.
+            roundStartSignature = lastRoundSignature
             var completed = 0
             var failed = 0
             // #475: gate inputs - see gateTxHistory.
