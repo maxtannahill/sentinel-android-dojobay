@@ -3,14 +3,17 @@ package com.samourai.sentinel.ui.collectionDetails.send
 import android.app.Application
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
+import com.samourai.sentinel.api.ApiService
 import com.samourai.sentinel.core.SentinelState
 import com.samourai.sentinel.core.hd.HD_Account
 import com.samourai.sentinel.data.AddressTypes
 import com.samourai.sentinel.data.PubKeyModel
 import com.samourai.sentinel.data.Utxo
+import com.samourai.sentinel.data.db.SentinelCollectionStore
 import com.samourai.sentinel.data.repository.CollectionRepository
 import com.samourai.sentinel.send.FeeUtil
 import com.samourai.sentinel.send.SuggestedFee
+import com.samourai.sentinel.ui.dojo.DojoUtility
 import com.samourai.sentinel.ui.utils.PrefsUtil
 import com.samourai.wallet.psbt.PSBT
 import com.samourai.wallet.segwit.SegwitAddress
@@ -19,9 +22,12 @@ import com.samourai.wallet.util.XPUB
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import org.bitcoinj.core.Coin
 import org.bitcoinj.core.ECKey
 import org.bitcoinj.core.NetworkParameters
 import org.bitcoinj.core.Transaction
+import org.bitcoinj.core.TransactionInput
+import org.bitcoinj.core.TransactionOutput
 import org.bitcoinj.crypto.ChildNumber
 import org.bitcoinj.crypto.HDKeyDerivation
 import org.bouncycastle.util.encoders.Hex
@@ -31,6 +37,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
+import org.junit.BeforeClass
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.koin.android.ext.koin.androidContext
@@ -38,10 +45,15 @@ import org.koin.core.context.GlobalContext
 import org.koin.core.context.startKoin
 import org.koin.core.context.stopKoin
 import org.koin.dsl.module
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.math.BigInteger
+import java.net.InetAddress
 
 /**
  * #257: the PSBT change derivation must sit on the output whose script is
@@ -62,7 +74,7 @@ class PsbtChangeDerivationTest {
 
     @Before
     fun setUp() {
-        ensureRuntime()
+        ensureRuntime(serverUrl())
         val suggested = SuggestedFee()
         suggested.defaultPerKB = BigInteger.valueOf(1000L)
         FeeUtil.getInstance().suggestedFee = suggested
@@ -75,7 +87,7 @@ class PsbtChangeDerivationTest {
         val psbt = compose(
             destination = wallet.externalAddress,
             amountSats = 9_900_000L,
-            utxos = listOf(wallet.utxo(value = 10_000_000L, index = 0, txid = txid(1)))
+            utxos = listOf(wallet.funded(value = 10_000_000L, index = 0))
         )
         val decoded = decode(psbt)
         assertEquals(2, decoded.tx.outputs.size)
@@ -89,7 +101,7 @@ class PsbtChangeDerivationTest {
         val psbt = compose(
             destination = wallet.externalAddress,
             amountSats = 20_000L,
-            utxos = listOf(wallet.utxo(value = 10_000_000L, index = 0, txid = txid(2)))
+            utxos = listOf(wallet.funded(value = 10_000_000L, index = 0))
         )
         val decoded = decode(psbt)
         assertEquals(2, decoded.tx.outputs.size)
@@ -98,10 +110,10 @@ class PsbtChangeDerivationTest {
 
     @Test
     fun spendAllHasNoChangeDerivationAndOneOutputMap() {
-        val utxo = wallet.utxo(value = 10_000_000L, index = 0, txid = txid(3))
+        val utxo = wallet.funded(value = 10_000_000L, index = 0)
         val psbt = compose(
             destination = wallet.externalAddress,
-            amountSats = utxo.value!!,
+            amountSats = utxo.utxo.value!!,
             utxos = listOf(utxo)
         )
         val decoded = decode(psbt)
@@ -129,8 +141,8 @@ class PsbtChangeDerivationTest {
             destination = destination,
             amountSats = 10_000_000L,
             utxos = listOf(
-                wallet.utxo(value = 6_000_000L, index = 0, txid = txid(4)),
-                wallet.utxo(value = 4_000_000L, index = 1, txid = txid(5))
+                wallet.funded(value = 6_000_000L, index = 0),
+                wallet.funded(value = 4_000_000L, index = 1)
             )
         )
         val decoded = decode(psbt)
@@ -181,14 +193,14 @@ class PsbtChangeDerivationTest {
         assertTrue("unexpected output derivation $paths", paths.isEmpty())
     }
 
-    private fun compose(destination: String, amountSats: Long, utxos: List<Utxo>): ByteArray {
+    private fun compose(destination: String, amountSats: Long, utxos: List<FundedUtxo>): ByteArray {
         val composer = TransactionComposer()
         composer.setPubKey(listOf(wallet.pub))
         return runBlocking {
             withTimeout(20_000) {
                 val fee = async { composer.getMinerFee().receive() }
                 val ok = composer.compose(
-                    inputUtxos = ArrayList(utxos),
+                    inputUtxos = ArrayList(utxos.map { it.utxo }),
                     inputAddress = destination,
                     inputFee = 1000L,
                     inputAmount = amountSats.toDouble()
@@ -278,24 +290,42 @@ class PsbtChangeDerivationTest {
             return SegwitAddress(key.pubKey, params).bech32AsString
         }
 
-        fun utxo(value: Long, index: Int, txid: String): Utxo {
+        fun funded(value: Long, index: Int): FundedUtxo {
             val account = HD_Account(params, zpub, "", 0)
             val key = account.getChain(0).getAddressAt(index).ecKey
             val address = SegwitAddress(key.pubKey, params).bech32AsString
             val script = Bech32UtilGeneric.getInstance().computeScriptPubKey(address, params)
-            return Utxo(
-                idx = txid,
-                addr = address,
-                confirmations = 1,
-                script = Hex.toHexString(script),
-                txHash = txid,
-                txOutputN = 0,
-                value = value,
-                path = "m/0/$index",
-                pubKey = zpub
+            // #469: compose() verifies every input against the prev tx it fetches,
+            // so the fixture txid is the real id of a real funding tx paying this
+            // exact output; the fake Dojo below serves that hex by txid.
+            val funding = Transaction(params)
+            // No inputs + one output serializes 0x00 0x01 at bytes 4-5, which a
+            // segwit parser reads as BIP144 marker+flag and mis-parses (CI run
+            // 42434828377). One dummy OP_TRUE input pins unambiguous legacy shape.
+            funding.addInput(TransactionInput(params, funding, byteArrayOf(0x51)))
+            funding.addOutput(TransactionOutput(params, funding, Coin.valueOf(value), script))
+            val hex = Hex.toHexString(funding.bitcoinSerialize())
+            val txid = funding.hash.toString()
+            served[txid] = hex
+            return FundedUtxo(
+                Utxo(
+                    idx = txid,
+                    addr = address,
+                    confirmations = 1,
+                    script = Hex.toHexString(script),
+                    txHash = txid,
+                    txOutputN = 0,
+                    value = value,
+                    path = "m/0/$index",
+                    pubKey = zpub
+                ),
+                hex
             )
         }
     }
+
+    /** #469: the Utxo plus the funding-tx hex the fake Dojo serves. */
+    private class FundedUtxo(val utxo: Utxo, val hex: String)
 
     private class DecodedPsbt(
         val tx: Transaction,
@@ -356,27 +386,76 @@ class PsbtChangeDerivationTest {
         @Volatile
         private var startedKoin = false
 
-        private fun txid(n: Int): String = "%064x".format(n)
+        private lateinit var server: MockWebServer
 
-        private fun ensureRuntime() {
-            if (GlobalContext.getOrNull() == null) {
-                val app = ApplicationProvider.getApplicationContext<Application>()
-                val prefs = PrefsUtil(app)
-                prefs.testnet = false
-                startKoin {
-                    androidContext(app)
-                    modules(
-                        module {
-                            single { prefs }
-                            single { CollectionRepository() }
-                        }
-                    )
+        private val served = HashMap<String, String>()
+
+        private var oneShot: MockResponse? = null
+
+        private fun serverUrl(): String = server.url("/").toString()
+
+        private fun installDispatcher() {
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    oneShot?.let {
+                        oneShot = null
+                        return it
+                    }
+                    val txid = request.path!!.substringAfter("/tx/").removeSuffix("/HEX")
+                    val hex = served[txid]
+                        ?: return MockResponse().setResponseCode(404)
+                            .setBody("""{"status":"error"}""")
+                    return MockResponse()
+                        .setBody("""{"status":"ok","data":"$hex"}""")
                 }
-                startedKoin = true
             }
+        }
+
+
+        private fun ensureRuntime(baseUrl: String) {
+            // #469 CI (run 42426252881): another Robolectric class can leave a
+            // Koin graph running in this fork without an ApiService bean; the old
+            // start-only-when-null guard silently skipped registration and every
+            // compose test failed closed on NoBeanDefFound. Stop whatever graph is
+            // running, then always start ours.
+            GlobalContext.getOrNull()?.let { stopKoin() }
+            val app = ApplicationProvider.getApplicationContext<Application>()
+            val prefs = PrefsUtil(app)
+            prefs.testnet = false
+            prefs.apiEndPoint = baseUrl
+            startKoin {
+                androidContext(app)
+                modules(
+                    module {
+                        single { prefs }
+                        single { CollectionRepository() }
+                        // #469: compose() fetches the prev tx for every input;
+                        // this single serves it from the class-level fake Dojo.
+                        single { ApiService() }
+                        // #469 CI (run 42429551157): getAPIUrl() opens with
+                        // SentinelState.isTorRequired(), whose DojoUtility
+                        // lazy resolves on first use; the fixture module
+                        // never had one, so every prev-tx fetch died as
+                        // NoBeanDefFound. An empty Dojo store keeps
+                        // isDojoEnabled() false, so requests stay on the
+                        // plain apiEndPoint (the fake Dojo) with Tor off.
+                        single { SentinelCollectionStore() }
+                        single { DojoUtility() }
+                    }
+                )
+            }
+            startedKoin = true
             check(!SentinelState.isTestNet()) { "PSBT fixture is a mainnet zpub" }
             // Drain the main-thread work SentinelState posts on first use.
             shadowOf(Looper.getMainLooper()).idle()
+        }
+
+        @JvmStatic
+        @BeforeClass
+        fun setUpClass() {
+            server = MockWebServer()
+            server.start(InetAddress.getByName("127.0.0.1"), 0)
+            installDispatcher()
         }
 
         @JvmStatic
@@ -386,6 +465,9 @@ class PsbtChangeDerivationTest {
                 stopKoin()
                 startedKoin = false
             }
+            server.shutdown()
+            served.clear()
+            oneShot = null
         }
     }
 }

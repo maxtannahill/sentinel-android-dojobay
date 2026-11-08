@@ -20,6 +20,7 @@ import com.samourai.wallet.send.MyTransactionOutPoint
 import com.samourai.wallet.send.UTXO
 import com.samourai.wallet.util.FormatsUtilGeneric
 import com.samourai.wallet.util.XPUB
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -27,6 +28,7 @@ import org.apache.commons.codec.binary.Hex
 import org.apache.commons.lang3.tuple.Triple
 import org.bitcoinj.core.Address
 import org.bitcoinj.core.ECKey
+import org.bitcoinj.core.Transaction
 import org.bitcoinj.params.MainNetParams
 import org.bitcoinj.script.ScriptBuilder
 import org.json.JSONObject
@@ -66,7 +68,6 @@ class TransactionComposer {
     private var feeCallBack: ((Long, minerFee: Long) -> Unit)? = null;
     private val minerFeeChannel = Channel<Long>()
     private val apiService: ApiService by KoinJavaComponent.inject(ApiService::class.java)
-    private var txData:String = ""
     private val HARDENED = 2147483648
     private val composeMutex = Mutex()
 
@@ -394,12 +395,13 @@ class TransactionComposer {
                             getAccount(input.pubKey)?.receive?.getAddressAt(addressIndex)?.ecKey
                         }
 
+                        val (prevTxHex, verifiedValue) = verifyPrevTx(outPoint)
                         if (purpose == 84 && FormatsUtil.isValidBech32(input.addr!!)) {
                             psbt?.addInput(
                                 networkParameters,
                                 Hex.decodeHex(data),
                                 eckeyInput,
-                                outPoint.value.value,
+                                verifiedValue,
                                 purpose,
                                 type,
                                 accountIdx.toInt(),
@@ -411,50 +413,31 @@ class TransactionComposer {
                                 input.addr!!
                             ).isP2SHAddress
                         ) {
-                            val response = apiService.getTxHex(outPoint.hash.toString())
-                            if (response.isSuccessful) {
-                                val body = response.body?.string()
-                                if (body != null) {
-                                    val jsonObject = JSONObject(body)
-                                    if (jsonObject.has("data"))
-                                        txData = jsonObject.getString("data")
-                                }
-                            }
-                            if (txData != "")
                                 psbt!!.addInputCompatibility(
                                     networkParameters,
                                     Hex.decodeHex(data),
                                     eckeyInput,
-                                    outPoint.value.value,
+                                    verifiedValue,
                                     purpose,
                                     type,
                                     accountIdx.toInt(),
                                     chainIndex,
                                     addressIndex,
-                                    txData,
+                                    prevTxHex,
                                     input.txOutputN!!
                                 );
                         } else if (purpose == 44 || !FormatsUtil.isValidBech32(input.addr!!)) {
-                            val response = apiService.getTxHex(outPoint.hash.toString())
-                            if (response.isSuccessful) {
-                                val body = response.body?.string()
-                                if (body != null) {
-                                    val jsonObject = JSONObject(body)
-                                    if (jsonObject.has("data"))
-                                        txData = jsonObject.getString("data")
-                                }
-                            }
 
                             psbt?.addInputLegacy(
                                 Hex.decodeHex(data),
                                 eckeyInput,
-                                outPoint.value.value,
+                                verifiedValue,
                                 purpose,
                                 type,
                                 accountIdx.toInt(),
                                 chainIndex,
                                 addressIndex,
-                                txData
+                                prevTxHex
                             );
                         }
                         break
@@ -471,6 +454,70 @@ class TransactionComposer {
             return true
         }
     }
+
+    /**
+     * #469: fetches the prev transaction for [outPoint] and checks it against
+     * what Dojo reported, before any input map is built.
+     *
+     * A SegWit signature commits to PSBT_IN_WITNESS_UTXO and a legacy
+     * signature commits to the whole prev tx, so a compromised Dojo could
+     * otherwise have the wallet sign whatever amount it reported: the
+     * native-SegWit branch (84) never fetched the prev tx at all, and the
+     * other two fetched it but trusted it.
+     *
+     * Returns the prev-tx hex and the on-chain output value; every branch
+     * consumes those. Fails closed with [ComposeException] on any fetch,
+     * parse, hash, bounds or value problem - the send screen reports
+     * cannot-compose instead of building a PSBT from unverified data.
+     *
+     * The hash check compares Transaction.getHash objects: getHash()
+     * serializes with TransactionOptions.NONE (no witness bytes, no
+     * marker/flag) before the double-SHA256, which is exactly the txid Dojo
+     * quotes for both SegWit and legacy prev txs. Never hash
+     * bitcoinSerialize() here - the public serializer includes witness
+     * bytes and would not match a txid for a witnessed prev tx.
+     */
+    private suspend fun verifyPrevTx(outPoint: MyTransactionOutPoint): Pair<String, Long> {
+        val txid = outPoint.hash.toString()
+        val response = try {
+            apiService.getTxHex(txid)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            throw ComposeException("Unable to verify input $txid").apply { initCause(e) }
+        }
+        if (!response.isSuccessful) {
+            throw ComposeException("Prev tx fetch failed for $txid (HTTP ${response.code})")
+        }
+        val hex = try {
+            val body = response.body?.string()
+            val json = body?.let { JSONObject(it) }
+            if (json != null && json.has("data")) json.getString("data") else null
+        } catch (e: Exception) {
+            null
+        }
+        if (hex.isNullOrEmpty()) {
+            throw ComposeException("No prev tx data for $txid")
+        }
+        val prevTx = try {
+            Transaction(SentinelState.getNetworkParam(), Hex.decodeHex(hex.toCharArray()))
+        } catch (e: Exception) {
+            throw ComposeException("Prev tx unparseable for $txid").apply { initCause(e) }
+        }
+        if (prevTx.hash != outPoint.hash) {
+            throw ComposeException("Prev tx hash mismatch for $txid")
+        }
+        val outputIndex = outPoint.txOutputN
+        if (outputIndex < 0 || outputIndex >= prevTx.outputs.size) {
+            throw ComposeException("Prev tx output index out of range for $txid")
+        }
+        val verifiedValue = prevTx.getOutput(outputIndex.toLong()).value.value
+        if (verifiedValue != outPoint.value.value) {
+            throw ComposeException("Prev tx value mismatch for $txid")
+        }
+        return Pair(hex, verifiedValue)
+    }
+
 
     private fun getAccount(pubkeyStr: String? = null): HD_Account? {
         //TODO: check what this method is used for and if we can make selectPubkeyModel a list of deposit pubs
