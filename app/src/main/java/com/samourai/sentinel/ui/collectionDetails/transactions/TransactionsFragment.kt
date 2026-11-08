@@ -1,5 +1,6 @@
 package com.samourai.sentinel.ui.collectionDetails.transactions
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
@@ -408,12 +409,14 @@ class TransactionsFragment : Fragment() {
             startActivityForResult(Intent(context, CollectionEditActivity::class.java).apply {
                 putExtra("collection", collection.id)
             }, EDIT_REQUEST_ID)
+            return true
         }
         if (item.itemId == R.id.collection_details_transaction_utxos) {
             startActivityForResult(Intent(context, UtxosActivity::class.java).apply {
                 putExtra("collection", collection.id)
                 putExtra("indexPub", indexPubSelected.value)
             }, EDIT_REQUEST_ID)
+            return true
         }
         if (item.itemId == R.id.collection_details_transaction_rescan) {
             // Every key in this collection: a missing balance is noticed here,
@@ -423,9 +426,22 @@ class TransactionsFragment : Fragment() {
                 collection.pubs,
                 listOf(collection.id)
             )
+            return true
         }
 
         return super.onOptionsItemSelected(item)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        // Save returns RESULT_OK after the live collection is updated.
+        // Rebind on this frame so the title and tabs show the edit
+        // without waiting for the async payload write to emit.
+        if (requestCode == EDIT_REQUEST_ID && resultCode == Activity.RESULT_OK &&
+            view != null && ::collection.isInitialized
+        ) {
+            onCollectionRefreshed(collection)
+        }
     }
 
     fun setBalance(balance: LiveData<Long>) {

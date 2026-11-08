@@ -3,16 +3,17 @@ package com.samourai.sentinel.ui.collectionEdit
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Rect
 import android.os.Bundle
 import android.view.Menu
 import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.viewModels
 import androidx.core.widget.NestedScrollView
-import androidx.core.widget.doOnTextChanged
 import androidx.lifecycle.Observer
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -77,12 +78,13 @@ class CollectionEditActivity : SentinelActivity() {
 
 
         viewModel.getCollection().observe(this) {
+            // The name field is a draft. Writing each keystroke onto the
+            // live collection published an unconfirmed name (Back could
+            // not drop it; the next sync persisted it) and a Save that
+            // re-emitted this LiveData rebound the screen mid-tap.
             binding.collectionEdiText.setText(it.collectionLabel.trimEnd())
             pubKeyAdapter.setIsImportFromWallet(it.isImportFromWallet)
             setUpPubKeyList()
-            binding.collectionEdiText.doOnTextChanged { text, _, _, _ ->
-                it.collectionLabel = text.toString()
-            }
         }
 
 
@@ -92,7 +94,7 @@ class CollectionEditActivity : SentinelActivity() {
 
         viewModel.message.observe(this, Observer {
             if (it != null) {
-                if (it.isEmpty()) {
+                if (it.isEmpty() || isFinishing) {
                     return@Observer
                 }
                 AndroidUtil.hideKeyboard(this)
@@ -250,16 +252,26 @@ class CollectionEditActivity : SentinelActivity() {
         }
     }
 
-    override fun onBackPressed() {
-        if (binding.collectionEdiText.text.isNullOrEmpty() || binding.collectionEdiText.text.isBlank()) {
-            this@CollectionEditActivity.showFloatingSnackBar(
-                binding.collectionEdiText.parent as ViewGroup,
-                text = "Please enter collection label",
-                duration = Snackbar.LENGTH_SHORT
-            )
-            return
+    /**
+     * The name field keeps focus after an edit, so the first Save tap is
+     * also the tap that dismisses the keyboard. Clearing focus here, on
+     * the same DOWN, lets that gesture reach the toolbar action. The
+     * activity's adjustNothing mode keeps the hide from resizing the
+     * window and cancelling the click.
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.action == MotionEvent.ACTION_DOWN) {
+            val focused = currentFocus
+            if (focused is EditText) {
+                val rect = Rect()
+                focused.getGlobalVisibleRect(rect)
+                if (!rect.contains(ev.rawX.toInt(), ev.rawY.toInt())) {
+                    focused.clearFocus()
+                    AndroidUtil.hideKeyboard(this)
+                }
+            }
         }
-        super.onBackPressed()
+        return super.dispatchTouchEvent(ev)
     }
 
     private fun setUpPubKeyList() {
@@ -479,16 +491,7 @@ class CollectionEditActivity : SentinelActivity() {
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
         if (item.itemId == R.id.saveCollectionMenuItem || item.itemId == android.R.id.home) {
-            if (binding.collectionEdiText.text.isNullOrEmpty() || binding.collectionEdiText.text.isBlank()) {
-                this@CollectionEditActivity.showFloatingSnackBar(
-                    binding.collectionEdiText.parent as ViewGroup,
-                    text = "Please enter collection label",
-                    duration = Snackbar.LENGTH_SHORT
-                )
-            } else {
-                viewModel.save()
-                this.finish()
-            }
+            commitDraftAndClose()
         }
         else if (item.itemId == R.id.deleteCollection) {
             deleteCollection()
@@ -496,6 +499,36 @@ class CollectionEditActivity : SentinelActivity() {
         else
             return super.onOptionsItemSelected(item)
         return true
+    }
+
+    /**
+     * One Save writes the draft name onto the live collection, persists
+     * it, and leaves. Back never reaches this, so an unconfirmed name
+     * stays in the field and is dropped with the screen. A blank name
+     * is rejected and the screen stays.
+     */
+    private fun commitDraftAndClose() {
+        val draft = binding.collectionEdiText.text?.toString()?.trim().orEmpty()
+        if (draft.isEmpty()) {
+            this@CollectionEditActivity.showFloatingSnackBar(
+                binding.collectionEdiText.parent as ViewGroup,
+                text = "Please enter collection label",
+                duration = Snackbar.LENGTH_SHORT
+            )
+            return
+        }
+        val collection = viewModel.getCollection().value
+        if (collection == null) {
+            finish()
+            return
+        }
+        AndroidUtil.hideKeyboard(this)
+        collection.collectionLabel = draft
+        viewModel.save()
+        setResult(Activity.RESULT_OK, Intent().apply {
+            if (collection.id.isNotEmpty()) putExtra("collection", collection.id)
+        })
+        finish()
     }
 
     private fun deleteCollection() {

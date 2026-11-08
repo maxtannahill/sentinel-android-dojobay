@@ -43,7 +43,14 @@ class CollectionEditViewModel : ViewModel() {
                 // outer lock).
                 collection.pubs = ArrayList(pubKeys.value!!)
                 repository.update(collection)
-                pubKeyCollectionLiveData.postValue(collection)
+                // Save used to post this same instance back through
+                // getCollection(). The screen's observer binds the name
+                // field and rebuilds the key list on every emission, so
+                // that post was an intermediate reset in the middle of
+                // leaving the screen (another setText, another watcher,
+                // another recycler setup). Persistence is the update()
+                // above; the field draft is committed by the activity
+                // before this runs.
                 message.postValue("Collection Updated")
             }
         }
