@@ -9,9 +9,11 @@ import com.samourai.sentinel.core.hd.HD_Account
 import com.samourai.sentinel.data.AddressTypes
 import com.samourai.sentinel.data.PubKeyModel
 import com.samourai.sentinel.data.Utxo
+import com.samourai.sentinel.data.db.SentinelCollectionStore
 import com.samourai.sentinel.data.repository.CollectionRepository
 import com.samourai.sentinel.send.FeeUtil
 import com.samourai.sentinel.send.SuggestedFee
+import com.samourai.sentinel.ui.dojo.DojoUtility
 import com.samourai.sentinel.ui.utils.PrefsUtil
 import com.samourai.wallet.psbt.PSBT
 import com.samourai.wallet.segwit.SegwitAddress
@@ -425,6 +427,15 @@ class PsbtChangeDerivationTest {
                         // #469: compose() fetches the prev tx for every input;
                         // this single serves it from the class-level fake Dojo.
                         single { ApiService() }
+                        // #469 CI (run 42429551157): getAPIUrl() opens with
+                        // SentinelState.isTorRequired(), whose DojoUtility
+                        // lazy resolves on first use; the fixture module
+                        // never had one, so every prev-tx fetch died as
+                        // NoBeanDefFound. An empty Dojo store keeps
+                        // isDojoEnabled() false, so requests stay on the
+                        // plain apiEndPoint (the fake Dojo) with Tor off.
+                        single { SentinelCollectionStore() }
+                        single { DojoUtility() }
                     }
                 )
             }
