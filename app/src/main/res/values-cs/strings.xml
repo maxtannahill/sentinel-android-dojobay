@@ -330,4 +330,6 @@
     <string name="pairing_import_slot_unrecognised">nerozpoznaná položka</string>
     <string name="pairing_import_extra_entry">Položka %1$d</string>
 
+    <string name="pin_pad_backspace">Smazat znak</string>
+
 </resources>

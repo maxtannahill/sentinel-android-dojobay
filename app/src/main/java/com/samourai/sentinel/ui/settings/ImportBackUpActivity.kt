@@ -11,6 +11,8 @@ import androidx.activity.viewModels
 import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
 import androidx.core.widget.addTextChangedListener
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.FragmentManager
 import androidx.fragment.app.FragmentTransaction
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -140,10 +142,33 @@ class ImportBackUpActivity : SentinelActivity() {
      */
     private var pendingRestorePin: String? = null
 
+    /**
+     * #363 / #420: pads are added and removed without the back stack,
+     * so a back-stack listener never sees them. View creation and
+     * destruction cover show, dismiss, and recreation.
+     */
+    private val importPadLifecycle = object : FragmentManager.FragmentLifecycleCallbacks() {
+        override fun onFragmentViewCreated(
+            fm: FragmentManager,
+            f: Fragment,
+            v: View,
+            savedInstanceState: Bundle?,
+        ) {
+            if (f is LockScreenDialog) schedulePadAccessibilitySync()
+        }
+
+        override fun onFragmentViewDestroyed(fm: FragmentManager, f: Fragment) {
+            if (f is LockScreenDialog) schedulePadAccessibilitySync()
+        }
+    }
+
     override fun onCreateAdmitted(savedInstanceState: Bundle?) {
         binding = ActivityImportBackUpBinding.inflate(layoutInflater)
         val view = binding.root
         setContentView(view)
+        // Registered before any pad transaction so a restored pad's
+        // view is observed when it is created.
+        supportFragmentManager.registerFragmentLifecycleCallbacks(importPadLifecycle, false)
         setSupportActionBar(binding.toolbarImportActivity)
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
 
@@ -1427,6 +1452,80 @@ class ImportBackUpActivity : SentinelActivity() {
         supportFragmentManager.beginTransaction().remove(existing).commit()
     }
 
+    /**
+     * #363 / #420: a pad added to android.R.id.content covers the import
+     * screen but does not replace it, and the confirm pad is added the
+     * same way on top of the set pad. Accessibility services still walk
+     * every sibling, so TalkBack can reach the import controls and, on
+     * the confirm step, the set pad's keys and its confirm control.
+     * While a pad is showing, every other child of the content root is
+     * hidden. Closing that pad puts the layer under it back.
+     */
+    private fun schedulePadAccessibilitySync() {
+        syncPadAccessibility()
+        if (!::binding.isInitialized) return
+        binding.root.post {
+            if (!isDestroyed) syncPadAccessibility()
+        }
+    }
+
+    private fun syncPadAccessibility() {
+        if (!::binding.isInitialized || isDestroyed) return
+        val content = findViewById<ViewGroup>(android.R.id.content) ?: return
+        val top = topmostShowingPad()
+        for (i in 0 until content.childCount) {
+            val child = content.getChildAt(i)
+            hideFromAccessibility(child, hidden = top != null && child !== top)
+        }
+        // A pad hosted in its own window is not one of those children.
+        // The loop already hid the import screen. Hide every other pad
+        // and leave the one on top reachable.
+        if (top != null && top.parent !== content) {
+            for (tag in padTagsBottomToTop()) {
+                val view = showingPadView(tag) ?: continue
+                if (view === top || view.parent === content) continue
+                hideFromAccessibility(view, hidden = true)
+            }
+            hideFromAccessibility(top, hidden = false)
+        }
+    }
+
+    private fun topmostShowingPad(): View? {
+        var top: View? = null
+        for (tag in padTagsBottomToTop()) {
+            val view = showingPadView(tag) ?: continue
+            top = view
+        }
+        return top
+    }
+
+    private fun showingPadView(tag: String): View? {
+        val fragment = supportFragmentManager.findFragmentByTag(tag) as? LockScreenDialog
+            ?: return null
+        if (!fragment.isAdded || fragment.isRemoving) return null
+        return fragment.view
+    }
+
+    private fun padTagsBottomToTop(): List<String> = listOf(
+        TAG_IMPORT_PIN,
+        TAG_RESTORE_PIN_SET,
+        TAG_RESTORE_PIN_CONFIRM,
+    )
+
+    private fun hideFromAccessibility(view: View, hidden: Boolean) {
+        view.importantForAccessibility =
+            if (hidden) View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            else View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // A pad restored with the activity does not always emit a view
+        // callback after the listener is registered. Settle once the
+        // view exists.
+        syncPadAccessibility()
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(STATE_OFFER_PIN, offerPinPending)
@@ -1435,6 +1534,7 @@ class ImportBackUpActivity : SentinelActivity() {
     }
 
     override fun onDestroy() {
+        supportFragmentManager.unregisterFragmentLifecycleCallbacks(importPadLifecycle)
         // #358: the import derive blocks on IO. viewModelScope is
         // cancelled only after that returns, so drop the overlay with
         // the window. Also covers the decrypt wait (#355). Safe if the

@@ -131,4 +131,6 @@
 
     <string name="track_new">Seuraa uutta...</string>
 
+    <string name="pin_pad_backspace">Askelpalautin</string>
+
 </resources>

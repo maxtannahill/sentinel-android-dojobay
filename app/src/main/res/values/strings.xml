@@ -93,6 +93,8 @@
     <string name="xpub_error">There was an error creating a wallet from your XPUBs/bitcoin addresses. Please try again.</string>
     <string name="create_pin">Create PIN code</string>
     <string name="confirm_pin">Confirm PIN code</string>
+    <!-- The PIN pad backspace key is an image. TalkBack needs a name, in the device language. -->
+    <string name="pin_pad_backspace">Backspace</string>
     <string name="entering_stealth">Applying PIN code. Please wait.</string>
 
     <string name="error_activating_stealth">Error activating stealth launch. If the error persists, reinstall Sentinel.</string>

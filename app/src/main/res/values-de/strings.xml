@@ -156,7 +156,9 @@
 
     <string name="permission_alert_dialog_title_camera">Zugriff auf Kamera erforderlich</string>
     <string name="permission_dialog_message_camera">Deine Wallet benötigt Zugriff auf die Kamera, um QR-Codes scannen zu können.</string>
-	
+
+    <string name="pin_pad_backspace">Rücktaste</string>
+
 </resources>
 
 <!-- Hinweis: 

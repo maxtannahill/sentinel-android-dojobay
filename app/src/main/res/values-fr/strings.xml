@@ -157,4 +157,6 @@
     <string name="permission_alert_dialog_title_camera">Demande autorisation caméra</string>
     <string name="permission_dialog_message_camera">Votre portefeuille a besoin d\'un accès à la caméra pour pouvoir scanner les codes QR.</string>
 
+    <string name="pin_pad_backspace">Retour arrière</string>
+
 </resources>

@@ -144,4 +144,6 @@
 
     <string name="tx_length_error">Samuray, 100KB boyutu üzerindeki işlemleri gerçekleştirmemektedir. Lütfen işleminizi bölmeyi deneyin.</string>
 
+    <string name="pin_pad_backspace">Geri sil</string>
+
 </resources>

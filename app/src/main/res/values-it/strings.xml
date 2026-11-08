@@ -154,4 +154,6 @@
     <string name="permission_alert_dialog_title_camera">Richiesta permessi per fotocamera</string>
     <string name="permission_dialog_message_camera">Il tuo wallet ha bisogno di accedere alla fotocamera per leggere i codici QR.</string>
 
+    <string name="pin_pad_backspace">Cancella</string>
+
 </resources>

@@ -167,6 +167,7 @@
         android:layout_marginStart="8dp"
         android:layout_marginEnd="8dp"
         android:background="?android:attr/selectableItemBackground"
+        android:contentDescription="@string/pin_pad_backspace"
         android:elevation="0dp"
         android:src="@drawable/ic_backspace_white_24"
         android:stateListAnimator="@null"
