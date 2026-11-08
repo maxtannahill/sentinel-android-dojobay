@@ -12,9 +12,11 @@ import android.view.View
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.webkit.*
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.samourai.sentinel.R
 import com.samourai.sentinel.core.SentinelState
 import com.samourai.sentinel.data.Tx
@@ -32,6 +34,7 @@ class ExplorerWebViewActivity : AppCompatActivity() {
     var tx: Tx? = null
     var url = ""
     lateinit var binding: ActivityExplorerWebViewBinding
+    private var blockedDialog: AlertDialog? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -57,60 +60,128 @@ class ExplorerWebViewActivity : AppCompatActivity() {
         if (WebViewFeature.isFeatureSupported(WebViewFeature.FORCE_DARK)) {
             WebSettingsCompat.setForceDark(binding.webView.settings, WebSettingsCompat.FORCE_DARK_ON)
         }
-        //Check webkit supports proxy
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
-            // #241: plain ON is published at boot=5, before the SOCKS
-            // listener exists (#135) - the old setProxy() at plain ON
-            // interpolated a null proxy into the rule ("SOCKS:/null": a
-            // rule pointing at a literal host named "null"), and the old
-            // else-arm loaded STARTING sessions direct too. Fail closed
-            // until fully ready; the Tor observer's ON arm below completes
-            // the load once the listener is live.
-            when {
-                SentinelTorManager.isTorReady() -> setProxy()
-                SentinelTorManager.getTorState().state == EnumTorState.OFF ->
-                    // Tor explicitly disabled: direct is the expected mode.
-                    load()
-                else -> {
-                    // STARTING / ON-before-listener: defer, show the same
-                    // progress the page load uses - fetch nothing.
-                    binding.progressWeb.visibility = View.VISIBLE
-                }
-            }
-        } else {
-            this.showFloatingSnackBar(binding.webView, text = "Your android does not support proxy enabled WebView", actionText = "Continue", actionClick = {
-                load()
-            }
+        // #472: Tor-required is part of every load decision. #241 already
+        // fails closed on STARTING / ON-before-listener; this adds the OFF
+        // and unsupported-proxy arms, which used to load direct even when
+        // a paired Dojo or the Tor toggle requires Tor.
+        val decision = explorerLoadDecision(
+            proxyOverrideSupported = WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE),
+            torReady = SentinelTorManager.isTorReady(),
+            torOff = SentinelTorManager.getTorState().state == EnumTorState.OFF,
+            torRequired = SentinelState.isTorRequired(),
+        )
+        when (decision) {
+            ExplorerLoadDecision.LOAD_VIA_PROXY -> setProxy()
+            // Tor optional and disabled: direct is the expected mode.
+            ExplorerLoadDecision.LOAD_DIRECT -> load()
+            // STARTING / ON-before-listener: defer, show the same progress
+            // the page load uses - fetch nothing. The Tor observer's ON arm
+            // completes the load once the listener is live.
+            ExplorerLoadDecision.WAIT_FOR_TOR -> binding.progressWeb.visibility = View.VISIBLE
+            ExplorerLoadDecision.BLOCK_TOR_OFF -> showBlocked(
+                getString(R.string.explorer_tor_required_title),
+                getString(R.string.explorer_tor_required_off),
+                allowWait = true
             )
+            ExplorerLoadDecision.BLOCK_PROXY_UNSUPPORTED -> showBlocked(
+                getString(R.string.explorer_tor_required_title),
+                getString(R.string.explorer_tor_required_unsupported),
+                allowWait = false
+            )
+            // Tor optional: going direct is the user's explicit choice.
+            ExplorerLoadDecision.OFFER_DIRECT_UNSUPPORTED ->
+                this.showFloatingSnackBar(
+                    binding.webView,
+                    text = getString(R.string.explorer_proxy_unsupported_optional),
+                    actionText = getString(R.string.explorer_continue_without_tor),
+                    actionClick = { load() }
+                )
         }
     }
 
-    private fun setProxy() {
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
-            // #241: null must never reach the rule - callers gate on
-            // isTorReady(); this re-reads and fails closed.
-            val proxy = SentinelTorManager.getProxy() ?: run {
-                Timber.w("Explorer proxy deferred: SOCKS listener not yet published (#241)")
-                return
+    /**
+     * #472: the explorer will not fetch anything. Explains why and offers
+     * a safe exit; never a direct-load fallback. With [allowWait] the
+     * screen stays open and the Tor observer loads through the proxy if
+     * Tor becomes ready.
+     */
+    private fun showBlocked(title: String, message: String, allowWait: Boolean) {
+        if (isFinishing || isDestroyed) return
+        binding.progressWeb.visibility = View.INVISIBLE
+        blockedDialog?.dismiss()
+        val builder = MaterialAlertDialogBuilder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setCancelable(false)
+            .setPositiveButton(R.string.explorer_close) { _, _ -> finish() }
+        if (allowWait) {
+            builder.setNegativeButton(R.string.explorer_wait_for_tor) { _, _ ->
+                binding.progressWeb.visibility = View.VISIBLE
             }
-            // androidx.webkit expects "socks://host:port" - the old
-            // "SOCKS:/" + address() built "SOCKS:///127.0.0.1:9050" from
-            // InetSocketAddress's leading slash (and "SOCKS:/null" on the
-            // boot=5 window). Build the rule from the parsed fields.
-            val address = proxy.address() as? InetSocketAddress ?: return
-            // #252 regression fix: .hostName resolves. Android drops the
-            // constructor's host string once it resolves, so the getter
-            // falls through to a reverse-DNS lookup - a network call on
-            // the main thread, NetworkOnMainThreadException at launch.
-            // hostString never resolves and exists since API 24 (= minSdk).
+        }
+        blockedDialog = builder.show()
+    }
+
+    private fun setProxy() {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
+            // Only reachable if support changed under us; never go direct.
+            showBlocked(
+                getString(R.string.explorer_tor_required_title),
+                getString(R.string.explorer_tor_required_unsupported),
+                allowWait = false
+            )
+            return
+        }
+        // #241: null must never reach the rule - callers gate on
+        // isTorReady(); this re-reads and fails closed.
+        val proxy = SentinelTorManager.getProxy() ?: run {
+            Timber.w("Explorer proxy deferred: SOCKS listener not yet published (#241)")
+            return
+        }
+        // androidx.webkit expects "socks://host:port" - the old
+        // "SOCKS:/" + address() built "SOCKS:///127.0.0.1:9050" from
+        // InetSocketAddress's leading slash (and "SOCKS:/null" on the
+        // boot=5 window). Build the rule from the parsed fields.
+        val address = proxy.address() as? InetSocketAddress ?: run {
+            // #472: was a silent return - a spinner forever.
+            proxyFailed(IllegalStateException("Tor proxy has no socket address"))
+            return
+        }
+        // #252 regression fix: .hostName resolves. Android drops the
+        // constructor's host string once it resolves, so the getter
+        // falls through to a reverse-DNS lookup - a network call on
+        // the main thread, NetworkOnMainThreadException at launch.
+        // hostString never resolves and exists since API 24 (= minSdk).
+        try {
             val proxyConfig = ProxyConfig.Builder()
                 .addProxyRule("socks://${address.hostString}:${address.port}")
                 .build()
-            ProxyController.getInstance().setProxyOverride(proxyConfig, {
+            // #472: the old call passed load() as the Executor and an
+            // empty listener. Now the listener loads, on Main, only once
+            // the override is applied.
+            ProxyController.getInstance().setProxyOverride(
+                proxyConfig,
+                ContextCompat.getMainExecutor(this)
+            ) {
+                if (isFinishing || isDestroyed) return@setProxyOverride
+                blockedDialog?.dismiss()
+                blockedDialog = null
                 load()
-            }, {
-            })
+            }
+        } catch (e: Exception) {
+            // #472: an invalid rule or an unsupported override throws;
+            // fail closed with an explanation instead of a silent spinner.
+            proxyFailed(e)
         }
+    }
+
+    private fun proxyFailed(cause: Exception) {
+        Timber.e(cause, "Explorer proxy override failed (#472)")
+        showBlocked(
+            getString(R.string.explorer_tor_route_failed_title),
+            getString(R.string.explorer_tor_route_failed),
+            allowWait = false
+        )
     }
 
 
@@ -158,7 +229,10 @@ class ExplorerWebViewActivity : AppCompatActivity() {
                     // at full readiness. Until then this screen fetches
                     // nothing - the next state emission (listener published,
                     // boot=100) completes the load through the proxy.
-                    if (SentinelTorManager.isTorReady()) {
+                    // #472: unsupported devices were decided in onCreate.
+                    if (SentinelTorManager.isTorReady() &&
+                        WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)
+                    ) {
                         setProxy()
                     }
                 }
@@ -181,6 +255,8 @@ class ExplorerWebViewActivity : AppCompatActivity() {
 
 
     override fun onDestroy() {
+        blockedDialog?.dismiss()
+        blockedDialog = null
         binding.webView.stopLoading()
         binding.webView.destroy()
         super.onDestroy()
