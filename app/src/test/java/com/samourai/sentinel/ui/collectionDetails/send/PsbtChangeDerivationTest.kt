@@ -26,6 +26,7 @@ import org.bitcoinj.core.Coin
 import org.bitcoinj.core.ECKey
 import org.bitcoinj.core.NetworkParameters
 import org.bitcoinj.core.Transaction
+import org.bitcoinj.core.TransactionInput
 import org.bitcoinj.core.TransactionOutput
 import org.bitcoinj.crypto.ChildNumber
 import org.bitcoinj.crypto.HDKeyDerivation
@@ -298,6 +299,10 @@ class PsbtChangeDerivationTest {
             // so the fixture txid is the real id of a real funding tx paying this
             // exact output; the fake Dojo below serves that hex by txid.
             val funding = Transaction(params)
+            // No inputs + one output serializes 0x00 0x01 at bytes 4-5, which a
+            // segwit parser reads as BIP144 marker+flag and mis-parses (CI run
+            // 42434828377). One dummy OP_TRUE input pins unambiguous legacy shape.
+            funding.addInput(TransactionInput(params, funding, byteArrayOf(0x51)))
             funding.addOutput(TransactionOutput(params, funding, Coin.valueOf(value), script))
             val hex = Hex.toHexString(funding.bitcoinSerialize())
             val txid = funding.hash.toString()
