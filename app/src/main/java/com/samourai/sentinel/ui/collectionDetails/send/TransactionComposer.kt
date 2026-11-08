@@ -28,6 +28,7 @@ import org.apache.commons.codec.binary.Hex
 import org.apache.commons.lang3.tuple.Triple
 import org.bitcoinj.core.Address
 import org.bitcoinj.core.ECKey
+import org.bitcoinj.core.NetworkParameters
 import org.bitcoinj.core.Transaction
 import org.bitcoinj.params.MainNetParams
 import org.bitcoinj.script.ScriptBuilder
@@ -389,13 +390,35 @@ class TransactionComposer {
                         val path: String = input.path;
                         val addressIndex: Int = path.split("/".toRegex()).toTypedArray()[2].toInt()
                         val chainIndex = path.split("/".toRegex()).toTypedArray()[1].toInt()
-                        val eckeyInput = if (chainIndex == 1) {
-                            getAccount(input.pubKey)?.change?.getAddressAt(addressIndex)?.ecKey
+                        val derivedAddress = if (chainIndex == 1) {
+                            getAccount(input.pubKey)?.change?.getAddressAt(addressIndex)
                         } else {
-                            getAccount(input.pubKey)?.receive?.getAddressAt(addressIndex)?.ecKey
+                            getAccount(input.pubKey)?.receive?.getAddressAt(addressIndex)
                         }
+                        val eckeyInput = derivedAddress?.ecKey
 
-                        val (prevTxHex, verifiedValue) = verifyPrevTx(outPoint)
+                        val (prevTxHex, verifiedValue, prevScript) = verifyPrevTx(outPoint)
+                        // #477: the prev tx must pay the script this wallet
+                        // derives for the input's own path. Purpose comes
+                        // from the wallet's own model, the key from the
+                        // wallet's own derivation - never from the Dojo
+                        // payload. A mismatch is a lying Dojo serving an
+                        // input the wallet does not control: fail closed
+                        // before any input map is built.
+                        val derivedScript = derivedInputScript(
+                            purpose,
+                            derivedAddress?.addressString,
+                            eckeyInput,
+                            SentinelState.getNetworkParam()
+                                ?: throw ComposeException("Network parameters unavailable")
+                        ) ?: throw ComposeException(
+                            "Cannot derive script for purpose $purpose (${input.txHash})"
+                        )
+                        if (!derivedScript.contentEquals(prevScript)) {
+                            throw ComposeException(
+                                "Prev tx script does not match derived address (${input.txHash})"
+                            )
+                        }
                         if (purpose == 84 && FormatsUtil.isValidBech32(input.addr!!)) {
                             psbt?.addInput(
                                 networkParameters,
@@ -406,7 +429,9 @@ class TransactionComposer {
                                 type,
                                 accountIdx.toInt(),
                                 chainIndex,
-                                addressIndex
+                                addressIndex,
+                                prevTxHex,
+                                input.txOutputN!!
                             )
                         } else if (purpose == 49 || Address.fromBase58(
                                 SentinelState.getNetworkParam(),
@@ -429,6 +454,7 @@ class TransactionComposer {
                         } else if (purpose == 44 || !FormatsUtil.isValidBech32(input.addr!!)) {
 
                             psbt?.addInputLegacy(
+                                networkParameters,
                                 Hex.decodeHex(data),
                                 eckeyInput,
                                 verifiedValue,
@@ -437,7 +463,8 @@ class TransactionComposer {
                                 accountIdx.toInt(),
                                 chainIndex,
                                 addressIndex,
-                                prevTxHex
+                                prevTxHex,
+                                input.txOutputN!!
                             );
                         }
                         break
@@ -465,8 +492,8 @@ class TransactionComposer {
      * native-SegWit branch (84) never fetched the prev tx at all, and the
      * other two fetched it but trusted it.
      *
-     * Returns the prev-tx hex and the on-chain output value; every branch
-     * consumes those. Fails closed with [ComposeException] on any fetch,
+     * Returns the prev-tx hex, the on-chain output value, and the output's
+     * scriptPubKey; every branch consumes those. Fails closed with [ComposeException] on any fetch,
      * parse, hash, bounds or value problem - the send screen reports
      * cannot-compose instead of building a PSBT from unverified data.
      *
@@ -477,7 +504,7 @@ class TransactionComposer {
      * bitcoinSerialize() here - the public serializer includes witness
      * bytes and would not match a txid for a witnessed prev tx.
      */
-    private suspend fun verifyPrevTx(outPoint: MyTransactionOutPoint): Pair<String, Long> {
+    private suspend fun verifyPrevTx(outPoint: MyTransactionOutPoint): kotlin.Triple<String, Long, ByteArray> {
         val txid = outPoint.hash.toString()
         val response = try {
             apiService.getTxHex(txid)
@@ -511,11 +538,17 @@ class TransactionComposer {
         if (outputIndex < 0 || outputIndex >= prevTx.outputs.size) {
             throw ComposeException("Prev tx output index out of range for $txid")
         }
-        val verifiedValue = prevTx.getOutput(outputIndex.toLong()).value.value
+        val prevOutput = prevTx.getOutput(outputIndex.toLong())
+        val verifiedValue = prevOutput.value.value
         if (verifiedValue != outPoint.value.value) {
             throw ComposeException("Prev tx value mismatch for $txid")
         }
-        return Pair(hex, verifiedValue)
+        // #477: the output's scriptPubKey rides along so the compose loop
+        // can hold it against the wallet's own derivation for the input's
+        // path - a genuine prev tx with the right value still must pay a
+        // script this wallet controls, or a lying Dojo can make the wallet
+        // build inputs it does not own.
+        return kotlin.Triple(hex, verifiedValue, prevOutput.scriptBytes)
     }
 
 
@@ -606,4 +639,31 @@ class TransactionComposer {
         private const val TAG = "TransactionComposer"
     }
 
+}
+
+/**
+ * #477: the script the wallet itself derives for an input's path, per the
+ * account type - P2PKH for 44, P2SH-P2WPKH for 49, P2WPKH for 84. This is
+ * the independent side of the prev-tx script agreement check: it is derived
+ * from the wallet's own model and keys, never from the Dojo payload. Null
+ * for an unknown purpose or a missing derivation - callers fail closed.
+ */
+internal fun derivedInputScript(
+    purpose: Int,
+    addressString: String?,
+    ecKey: ECKey?,
+    params: NetworkParameters
+): ByteArray? = when (purpose) {
+    44 -> addressString?.let {
+        ScriptBuilder.createOutputScript(Address.fromBase58(params, it)).program
+    }
+    49 -> ecKey?.let { key ->
+        val address = P2SH_P2WPKH(key.pubKey, params).addressAsString
+        ScriptBuilder.createOutputScript(Address.fromBase58(params, address)).program
+    }
+    84 -> ecKey?.let { key ->
+        val address = SegwitAddress(key.pubKey, params).bech32AsString
+        Bech32UtilGeneric.getInstance().computeScriptPubKey(address, params)
+    }
+    else -> null
 }

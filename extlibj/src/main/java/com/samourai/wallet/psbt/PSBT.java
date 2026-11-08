@@ -6,7 +6,6 @@ import com.samourai.wallet.util.Z85;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.bitcoinj.core.*;
-import org.bitcoinj.params.TestNet3Params;
 import org.bouncycastle.util.encoders.Base64;
 import org.bouncycastle.util.encoders.Hex;
 
@@ -424,15 +423,24 @@ public class PSBT {
         psbtGlobals.add(populateEntry(type, keydata, data));
     }
 
-    public void addInput(NetworkParameters params, byte[] fingerprint, ECKey eckey, long amount, int purpose, int type, int account, int chain, int index) throws Exception    {
-        SegwitAddress segwitAddress = new SegwitAddress(eckey, params);
-        byte[] redeemScriptBuf = new byte[1 + segwitAddress.segwitRedeemScript().getProgram().length];
-        redeemScriptBuf[0] = (byte)0x16;
-        System.arraycopy(segwitAddress.segwitRedeemScript().getProgram(), 0, redeemScriptBuf, 1, segwitAddress.segwitRedeemScript().getProgram().length);
+    public void addInput(NetworkParameters params, byte[] fingerprint, ECKey eckey, long amount, int purpose, int type, int account, int chain, int index, String transactionData, int utxoIndex) throws Exception    {
+        // #477: the prev tx arrives verified (hash, value and - on the
+        // compose path - script held against the wallet's own derivation).
+        // Both utxo fields are written from that one transaction so a signer
+        // reads the same truth from either, and the two can never disagree:
+        // the witness utxo is the referenced output itself, and its value
+        // must equal the amount the caller verified.
+        Transaction prevTx = new Transaction(params, Hex.decode(transactionData));
+        if(utxoIndex < 0 || utxoIndex >= prevTx.getOutputs().size())    {
+            throw new Exception("utxoIndex out of range:" + utxoIndex);
+        }
+        TransactionOutput referenced = prevTx.getOutput((long)utxoIndex);
+        if(referenced.getValue().value != amount)    {
+            throw new Exception("witness utxo amount disagrees with prev tx:" + amount + " != " + referenced.getValue().value);
+        }
 
-        byte[] utxoBuf = writeSegwitInputUTXO(amount, redeemScriptBuf);
-
-        addInput(PSBT_IN_WITNESS_UTXO, null, utxoBuf);
+        addInput(PSBT_IN_NON_WITNESS_UTXO, null, Hex.decode(transactionData));
+        addInput(PSBT_IN_WITNESS_UTXO, null, referenced.bitcoinSerialize());
         addInput(PSBT_IN_BIP32_DERIVATION, eckey.getPubKey(), writeBIP32Derivation(fingerprint, purpose, type, account, chain, index));
         addInputSeparator();
     }
@@ -443,7 +451,16 @@ public class PSBT {
         byte[] redeemScript = Hex.decode(compatibleSegwit.segwitRedeemScriptToString());
 
 
-        Transaction tx = new Transaction(TestNet3Params.get(), Hex.decode(transactionData));
+        // #477: parse with the caller's network, not a hardcoded TestNet3,
+        // and hold the arm to the same agreement rule: the witness utxo is
+        // read from the referenced output, so the amount must match it.
+        Transaction tx = new Transaction(params, Hex.decode(transactionData));
+        if(utxoIndex < 0 || utxoIndex >= tx.getOutputs().size())    {
+            throw new Exception("utxoIndex out of range:" + utxoIndex);
+        }
+        if(tx.getOutput((long)utxoIndex).getValue().value != amount)    {
+            throw new Exception("witness utxo amount disagrees with prev tx:" + amount);
+        }
 
         addInput(PSBT_IN_NON_WITNESS_UTXO, null, Hex.decode(transactionData));
         addInput(PSBT_IN_WITNESS_UTXO, null, tx.getOutput(utxoIndex).bitcoinSerialize());
@@ -453,9 +470,18 @@ public class PSBT {
         addInputSeparator();
     }
 
-    public void addInputLegacy (byte[] fingerprint, ECKey eckey, long amount, int purpose, int type, int account, int chain, int index, String transactionData) throws Exception {
-
-        //System.arraycopy(transactionData, 0, transactionBytes, 0, transactionData.length());
+    public void addInputLegacy (NetworkParameters params, byte[] fingerprint, ECKey eckey, long amount, int purpose, int type, int account, int chain, int index, String transactionData, int utxoIndex) throws Exception {
+        // #477: the legacy arm carried the whole prev tx but never checked
+        // the amount against it - the amount parameter was simply unused.
+        // The referenced output's value must now agree with what the caller
+        // verified, the same rule as the SegWit arms.
+        Transaction prevTx = new Transaction(params, Hex.decode(transactionData));
+        if(utxoIndex < 0 || utxoIndex >= prevTx.getOutputs().size())    {
+            throw new Exception("utxoIndex out of range:" + utxoIndex);
+        }
+        if(prevTx.getOutput((long)utxoIndex).getValue().value != amount)    {
+            throw new Exception("non-witness utxo amount disagrees with prev tx:" + amount);
+        }
 
         addInput(PSBT_IN_NON_WITNESS_UTXO, null, Hex.decode(transactionData));
         addInput(PSBT_IN_SIGHASH_TYPE, null, Hex.decode("01000000"));
