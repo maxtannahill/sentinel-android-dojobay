@@ -8,13 +8,14 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.IBinder
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.samourai.sentinel.R
 import com.samourai.sentinel.api.ApiService
+import com.samourai.sentinel.util.LogRedaction
 import kotlinx.coroutines.*
 import org.json.JSONObject
 import org.koin.java.KoinJavaComponent
+import timber.log.Timber
 
 
 /**
@@ -59,12 +60,16 @@ class ImportSegWitService : Service() {
     }
 
     private fun startImporting(intent: Intent?) {
-        var pubKey = intent?.extras?.getString("pubKey")
-        var segwit = intent?.extras?.getString("segWit")
-        if (pubKey == null || segwit == null) {
+        // #465: only an opaque token crosses the Intent; the XPUB and
+        // account type come from the process-local handoff. The legacy
+        // "pubKey" / "segWit" extras are deliberately not read.
+        val request = ImportSegWitRequests.take(intent?.getStringExtra(EXTRA_REQUEST_TOKEN))
+        if (request == null) {
             this.stopSelf()
             return
         }
+        val pubKey = request.pubKey
+        val segwit = request.segWit
         scope.launch {
             try {
                 val deferredImportStatus = async { apiService.checkImportStatus(pubKey) }
@@ -116,7 +121,9 @@ class ImportSegWitService : Service() {
                 // #145: a null message must not silently skip the report -
                 // render the type when the message is absent.
                 failure(e.message ?: "${e::class.simpleName} (no message)")
-                e.printStackTrace()
+                // #465: printStackTrace() wrote straight to logcat, past the
+                // Timber tree that masks XPUBs and onion hosts (#96).
+                Timber.e(e, "SegWit XPUB import failed")
             }
         }
     }
@@ -133,9 +140,11 @@ class ImportSegWitService : Service() {
     }
 
     private fun failure(message: String) {
+        // #465: exception text can embed the request URL, which carries the
+        // XPUB; notifications are readable by listener apps.
         val notification = NotificationCompat.Builder(this, "IMPORT_CHANNEL")
                 .setContentTitle("Importing")
-                .setContentText("Error : $message")
+                .setContentText("Error : ${LogRedaction.redact(message)}")
                 .setSmallIcon(R.drawable.ic_sentinel)
                 .addAction(closeAction())
                 .build()
@@ -154,7 +163,7 @@ class ImportSegWitService : Service() {
 
     private fun getNotification(): Notification {
         return NotificationCompat.Builder(this, "IMPORT_CHANNEL")
-                .setContentTitle("Importing SegWit xpub")
+                .setContentTitle("Importing SegWit XPUB")
                 .setSmallIcon(R.drawable.ic_sentinel)
                 .setProgress(0, 0, true)
                 .setOnlyAlertOnce(true)
@@ -164,5 +173,22 @@ class ImportSegWitService : Service() {
 
     override fun onBind(p0: Intent?): IBinder? {
         return null
+    }
+
+    companion object {
+        /** #465: the only extra this service reads - an opaque token. */
+        const val EXTRA_REQUEST_TOKEN = "com.samourai.sentinel.service.ImportSegWitService.REQUEST"
+
+        /**
+         * Starts a SegWit XPUB import. The XPUB and account type stay in
+         * this process ([ImportSegWitRequests]); never put them on an Intent.
+         */
+        fun start(context: Context, pubKey: String, segWit: String) {
+            val token = ImportSegWitRequests.put(pubKey, segWit)
+            context.startService(
+                Intent(context, ImportSegWitService::class.java)
+                    .putExtra(EXTRA_REQUEST_TOKEN, token)
+            )
+        }
     }
 }
