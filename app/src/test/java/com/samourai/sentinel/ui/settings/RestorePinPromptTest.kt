@@ -251,7 +251,7 @@ class RestorePinPromptTest {
                 ImportBackUpActivity.REQUEST_KEY_RESTORE_PIN_CONFIRM,
                 Bundle().apply { putString(LockScreenDialog.RESULT_PIN, PIN) },
             )
-            awaitPinConfigured()
+            awaitPinEnabled()
         } finally {
             Timber.uproot(tree)
         }
@@ -561,13 +561,22 @@ class RestorePinPromptTest {
         activity?.supportFragmentManager?.executePendingTransactions()
     }
 
-    private fun awaitPinConfigured() {
+    /**
+     * #504: the confirm save runs on Dispatchers.IO and PinVault.enable
+     * commits twice on that worker - the key material first, the
+     * pinEnabled flag second. isPinConfigured() tracks the first
+     * commit, so polling it could exit inside the gap and leave the
+     * caller's pinEnabled assert to race the second commit. Await the
+     * enabled flag itself: both commits are synchronous on one worker,
+     * so pinEnabled implies the material landed too.
+     */
+    private fun awaitPinEnabled() {
         val deadline = System.currentTimeMillis() + 90_000
-        while (!prefs.isPinConfigured() && System.currentTimeMillis() < deadline) {
+        while (prefs.pinEnabled != true && System.currentTimeMillis() < deadline) {
             shadowOf(Looper.getMainLooper()).idle()
             Thread.sleep(50)
         }
-        assertTrue("PIN was not saved from the confirm pad", prefs.isPinConfigured())
+        assertTrue("PIN was not enabled from the confirm pad", prefs.pinEnabled == true)
     }
 
     private fun clearAccess() {
