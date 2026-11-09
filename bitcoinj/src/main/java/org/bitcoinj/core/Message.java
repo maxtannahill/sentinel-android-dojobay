@@ -312,7 +312,10 @@ public abstract class Message {
     }
 
     protected byte[] readBytes(int length) throws ProtocolException {
-        if (length > MAX_SIZE) {
+        int available = (cursor < 0 || payload == null || cursor > payload.length)
+                ? 0
+                : payload.length - cursor;
+        if (length < 0 || length > MAX_SIZE || length > available) {
             throw new ProtocolException("Claimed value length too large: " + length);
         }
         try {
@@ -325,9 +328,25 @@ public abstract class Message {
         }
     }
     
-    protected byte[] readByteArray() throws ProtocolException {
+    /**
+     * Reads a compact-size length and rejects it before any array is sized.
+     * A declared length has to fit in the bytes still unread and in
+     * {@link #MAX_SIZE}. A length that does not fit in a signed int is
+     * rejected here, so a later cast cannot turn it into a short read.
+     */
+    protected int readLength() throws ProtocolException {
         long len = readVarInt();
-        return readBytes((int)len);
+        int available = (cursor < 0 || payload == null || cursor > payload.length)
+                ? 0
+                : payload.length - cursor;
+        if (len < 0 || len > MAX_SIZE || len > available) {
+            throw new ProtocolException("Claimed value length too large: " + len);
+        }
+        return (int) len;
+    }
+
+    protected byte[] readByteArray() throws ProtocolException {
+        return readBytes(readLength());
     }
 
     protected String readStr() throws ProtocolException {

@@ -34,6 +34,20 @@ object ImportLimits {
     const val MAX_IMPORT_PUBKEYS = 5_000
 
     /**
+     * BIP-329 JSONL, file or scanned text. A watch-only history is one
+     * line per output, so this is the large legitimate import. Backup
+     * and transaction envelopes stay at their own limits.
+     */
+    const val LABELS_MAX_BYTES = 32 * 1024 * 1024
+
+    /**
+     * Pasted xpub, descriptor, pairing payload, private key, or password.
+     * Far above any real value. The clipboard already holds the string;
+     * this stops it being parsed or stored.
+     */
+    const val SENSITIVE_PASTE_MAX_CHARS = 1_048_576
+
+    /**
      * Reads at most [maxBytes] from [input] and decodes it as UTF-8.
      * Throws [ImportTooLargeException] as soon as byte `maxBytes + 1`
      * arrives; never consults `available()`. Does not close [input].
@@ -60,6 +74,21 @@ object ImportLimits {
     fun requireTextWithin(text: CharSequence, maxChars: Int) {
         if (text.length > maxChars) throw ImportTooLargeException(maxChars.toLong(), "characters")
     }
+
+    /** True when a key, descriptor, pairing payload, or password paste is over [SENSITIVE_PASTE_MAX_CHARS]. */
+    fun exceedsSensitivePaste(text: CharSequence): Boolean =
+        text.length > SENSITIVE_PASTE_MAX_CHARS
+
+    /**
+     * Label-import snackbar text. A size rejection is the limit sentence
+     * alone. Other failures keep the existing prefixed form.
+     */
+    fun labelImportFailureText(error: Throwable): String =
+        if (error is ImportTooLargeException) {
+            error.message ?: "Import is too large"
+        } else {
+            "Label import failed : $error"
+        }
 
     /** Rejects decoded payloads larger than [maxBytes]. */
     fun requireBytesWithin(bytes: ByteArray, maxBytes: Int) {

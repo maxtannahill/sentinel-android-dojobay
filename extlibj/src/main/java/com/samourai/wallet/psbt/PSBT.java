@@ -59,6 +59,12 @@ public class PSBT {
 
     private static final int HARDENED = 0x80000000;
 
+    /**
+     * Inflated PSBT text. Matches the broadcast text envelope: a gzip
+     * wrapper must not yield a larger payload than a direct paste.
+     */
+    static final int MAX_TEXT_CHARS = 1_000_000;
+
     private static final int STATE_START = 0;
     private static final int STATE_GLOBALS = 1;
     private static final int STATE_INPUTS = 2;
@@ -98,19 +104,7 @@ public class PSBT {
 
         String strPSBT = null;
         if(psbt.length > 2 && psbt[0] == (byte)0x1f && psbt[1] == (byte)0x8b)   {
-            ByteArrayInputStream bis = new ByteArrayInputStream(psbt);
-            GZIPInputStream gis = new GZIPInputStream(bis);
-            BufferedReader br = new BufferedReader(new InputStreamReader(gis, "UTF-8"));
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while((line = br.readLine()) != null) {
-                sb.append(line);
-            }
-            br.close();
-            gis.close();
-            bis.close();
-
-            strPSBT = sb.toString();
+            strPSBT = inflatePsbtText(psbt);
         }
         else   {
             strPSBT = Hex.toHexString(psbt);
@@ -370,6 +364,9 @@ public class PSBT {
                 Log("separator 0x00", true);
                 return entry;
             }
+            if(keyLen > psbtByteBuffer.remaining())    {
+                throw new Exception("Truncated PSBT");
+            }
 
             byte[] key = new byte[keyLen];
             psbtByteBuffer.get(key);
@@ -388,6 +385,9 @@ public class PSBT {
 
             int dataLen = PSBT.readCompactInt(psbtByteBuffer);
             Log("data length:" + dataLen, true);
+            if(dataLen > psbtByteBuffer.remaining())    {
+                throw new Exception("Truncated PSBT");
+            }
 
             byte[] data = new byte[dataLen];
             psbtByteBuffer.get(data);
@@ -705,32 +705,53 @@ public class PSBT {
             case (byte)0xfd: {
                 byte[] buf = new byte[2];
                 psbtByteBuffer.get(buf);
-                ByteBuffer byteBuffer = ByteBuffer.wrap(buf);
-//                log("value:" + Hex.toHexString(buf), true);
-                byteBuffer.order(ByteOrder.LITTLE_ENDIAN);
-                return byteBuffer.getShort();
+                return (buf[0] & 0xff) | ((buf[1] & 0xff) << 8);
             }
             case (byte)0xfe: {
                 byte[] buf = new byte[4];
                 psbtByteBuffer.get(buf);
-                ByteBuffer byteBuffer = ByteBuffer.wrap(buf);
-//                log("value:" + Hex.toHexString(buf), true);
-                byteBuffer.order(ByteOrder.LITTLE_ENDIAN);
-                return byteBuffer.getInt();
+                long value = (buf[0] & 0xffL)
+                        | ((buf[1] & 0xffL) << 8)
+                        | ((buf[2] & 0xffL) << 16)
+                        | ((buf[3] & 0xffL) << 24);
+                if(value > Integer.MAX_VALUE)    {
+                    throw new Exception("Data too long:" + value);
+                }
+                return (int)value;
             }
             case (byte)0xff: {
                 byte[] buf = new byte[8];
                 psbtByteBuffer.get(buf);
                 ByteBuffer byteBuffer = ByteBuffer.wrap(buf);
-//                log("value:" + Hex.toHexString(buf), true);
                 byteBuffer.order(ByteOrder.LITTLE_ENDIAN);
                 throw new Exception("Data too long:" + byteBuffer.getLong());
             }
             default:
-//                Log("compact int value:" + "value:" + Hex.toHexString(new byte[] { b }), true);
                 return (int)(b & 0xff);
         }
 
+    }
+
+    /**
+     * Inflates a gzip PSBT and drops CR/LF, the same way the old line
+     * reader did. Stops once the inflated text passes {@link #MAX_TEXT_CHARS}.
+     */
+    private static String inflatePsbtText(byte[] psbt) throws Exception {
+        try (ByteArrayInputStream bis = new ByteArrayInputStream(psbt);
+             GZIPInputStream gis = new GZIPInputStream(bis)) {
+            ByteArrayOutputStream raw = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int total = 0;
+            int n;
+            while ((n = gis.read(buf)) >= 0) {
+                if (n > MAX_TEXT_CHARS - total) {
+                    throw new Exception("Data too long:" + (total + (long) n));
+                }
+                total += n;
+                raw.write(buf, 0, n);
+            }
+            return raw.toString("UTF-8").replace("\r", "").replace("\n", "");
+        }
     }
 
     public static byte[] writeCompactInt(long val)   {

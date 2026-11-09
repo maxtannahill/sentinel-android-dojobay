@@ -59,6 +59,7 @@ import com.samourai.sentinel.ui.utils.RecyclerViewItemDividerDecorator
 import com.samourai.sentinel.ui.utils.shouldAdmitScan
 import com.samourai.sentinel.ui.views.GenericBottomSheet
 import com.samourai.sentinel.ui.views.SuccessfulBottomSheet
+import com.samourai.sentinel.util.ImportLimits
 import com.samourai.sentinel.util.MonetaryUtil
 import com.samourai.sentinel.util.apiScope
 import com.samourai.wallet.SamouraiWalletConst
@@ -343,6 +344,10 @@ class SweepKeyEntryFragment : Fragment {
             }
             lastDecodePayload = decoded
             lastDecodeAtMs = now
+            if (ImportLimits.exceedsSensitivePaste(decoded)) {
+                Toast.makeText(context, "Error parsing private key", Toast.LENGTH_LONG).show()
+                return@setFragmentResultListener
+            }
             if (isPrivateKey(decoded)) {
                 // #248: validate BEFORE the field write - garbage
                 // used to land verbatim in the private-key field
@@ -386,9 +391,13 @@ class SweepKeyEntryFragment : Fragment {
                 }
                 else -> {
                     try {
-                        val item = clipboard.primaryClip?.getItemAt(0)
-                        textPrivKey.editText!!.setText(item?.text.toString())
-                        if (isPrivateKey(item?.text.toString()))
+                        val pasted = clipboard.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+                        if (ImportLimits.exceedsSensitivePaste(pasted)) {
+                            Toast.makeText(context, "Error parsing private key", Toast.LENGTH_SHORT).show()
+                            return@setOnClickListener
+                        }
+                        textPrivKey.editText!!.setText(pasted)
+                        if (isPrivateKey(pasted))
                             startSweepBtn.alpha = 1f
                     } catch (e: Exception) {
                         Toast.makeText(context, "Error parsing private key", Toast.LENGTH_SHORT).show()

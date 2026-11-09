@@ -543,24 +543,35 @@ public class Transaction extends ChildMessage {
         witnesses = witnesses == null ? new ArrayList<TransactionWitness>() : witnesses;
     }
 
-    protected void readWitness() {
+    protected void readWitness() throws ProtocolException {
         witnesses = new ArrayList<TransactionWitness>(inputs.size());
         for (int i = 0; i < inputs.size(); i++) {
             long pushCount = readVarInt();
+            long remaining = bytesRemaining();
+            // Each item is at least a one-byte compact size. Refuse the count
+            // before TransactionWitness allocates its push array.
+            if (pushCount < 0 || pushCount > remaining) {
+                throw new ProtocolException("Too many witness items: " + pushCount);
+            }
             TransactionWitness witness = new TransactionWitness((int) pushCount);
             setWitness(i, witness);
             optimalEncodingMessageSize += VarInt.sizeOf(pushCount);
             for (int y = 0; y < pushCount; y++) {
-                long pushSize = readVarInt();
+                int pushSize = readLength();
                 optimalEncodingMessageSize += VarInt.sizeOf(pushSize) + pushSize;
-                byte[] push = readBytes((int) pushSize);
+                byte[] push = readBytes(pushSize);
                 witness.setPush(y, push);
             }
         }
     }
 
-    protected void readOutputs() {
+    protected void readOutputs() throws ProtocolException {
         long numOutputs = readVarInt();
+        long remaining = bytesRemaining();
+        // value (8) + at least one byte of script length.
+        if (numOutputs < 0 || numOutputs > remaining / 9L) {
+            throw new ProtocolException("Too many transaction outputs: " + numOutputs);
+        }
         optimalEncodingMessageSize += VarInt.sizeOf(numOutputs);
         outputs = new ArrayList<>((int) numOutputs);
         for (long i = 0; i < numOutputs; i++) {
@@ -572,8 +583,13 @@ public class Transaction extends ChildMessage {
         }
     }
 
-    protected void readInputs() {
+    protected void readInputs() throws ProtocolException {
         long numInputs = readVarInt();
+        long remaining = bytesRemaining();
+        // outpoint (36) + at least one byte of script length + sequence (4).
+        if (numInputs < 0 || numInputs > remaining / 41L) {
+            throw new ProtocolException("Too many transaction inputs: " + numInputs);
+        }
         optimalEncodingMessageSize += VarInt.sizeOf(numInputs);
         inputs = new ArrayList<TransactionInput>((int) numInputs);
         for (long i = 0; i < numInputs; i++) {
@@ -583,6 +599,13 @@ public class Transaction extends ChildMessage {
             optimalEncodingMessageSize += TransactionOutPoint.MESSAGE_LENGTH + VarInt.sizeOf(scriptLen) + scriptLen + 4;
             cursor += scriptLen + 4;
         }
+    }
+
+    private long bytesRemaining() {
+        if (payload == null || cursor < 0 || cursor > payload.length) {
+            return 0L;
+        }
+        return (long) payload.length - cursor;
     }
 
     public int getOptimalEncodingMessageSize() {

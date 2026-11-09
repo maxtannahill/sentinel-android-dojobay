@@ -6,8 +6,11 @@ import android.graphics.Typeface
 import android.text.InputType
 import android.text.method.PasswordTransformationMethod
 import android.widget.EditText
+import android.widget.Toast
 import com.google.android.material.textfield.TextInputLayout
 import com.samourai.sentinel.R
+import com.samourai.sentinel.util.ImportLimits
+import com.samourai.sentinel.util.ImportTooLargeException
 import com.samourai.sentinel.util.PairingWords
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -34,6 +37,17 @@ fun TextInputLayout.enablePasteAction(edit: EditText) {
             ?.toString()
             ?.trim()
         if (text.isNullOrEmpty()) return@setStartIconOnClickListener
+        if (ImportLimits.exceedsSensitivePaste(text)) {
+            Toast.makeText(
+                context,
+                ImportTooLargeException(
+                    ImportLimits.SENSITIVE_PASTE_MAX_CHARS.toLong(),
+                    "characters"
+                ).message,
+                Toast.LENGTH_LONG
+            ).show()
+            return@setStartIconOnClickListener
+        }
         edit.setText(text)
         edit.setSelection(edit.text?.length ?: 0)
     }
