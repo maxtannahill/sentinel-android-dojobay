@@ -35,6 +35,7 @@ class ExplorerWebViewActivity : AppCompatActivity() {
     var url = ""
     lateinit var binding: ActivityExplorerWebViewBinding
     private var blockedDialog: AlertDialog? = null
+    private var pageLoaded = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -208,6 +209,7 @@ class ExplorerWebViewActivity : AppCompatActivity() {
         tx?.let {
             url = intent.getStringExtra(EXTRA_URL)
                 ?: ExplorerRepository().getExplorer(it.hash.split("-")[0])
+            pageLoaded = true
             binding.webView.loadUrl(url)
         }
 
@@ -245,6 +247,22 @@ class ExplorerWebViewActivity : AppCompatActivity() {
                             R.color.md_grey_400
                         )
                     )
+                    // STARTING waits. If Tor then stops before any load,
+                    // explain it. Opening while already off showed this
+                    // dialog in onCreate; do not stack a second one.
+                    val stopped = explorerWhenTorStopsBeforeLoad(
+                        torRequired = SentinelState.isTorRequired(),
+                        pageLoaded = pageLoaded,
+                    )
+                    if (stopped == ExplorerLoadDecision.BLOCK_TOR_OFF &&
+                        blockedDialog?.isShowing != true
+                    ) {
+                        showBlocked(
+                            getString(R.string.explorer_tor_required_title),
+                            getString(R.string.explorer_tor_required_off),
+                            allowWait = true,
+                        )
+                    }
                 }
                 else -> {
                 }
