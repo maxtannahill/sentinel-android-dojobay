@@ -70,8 +70,8 @@ class CollectionEditActivity : SentinelActivity() {
     /**
      * Claimed only after the name validates, and held through a successful
      * save so a second tap cannot add the collection again. Released if
-     * saving throws, so a failed attempt can be retried. A blank name never
-     * claims it.
+     * saving throws or nothing was written, so a failed attempt can be
+     * retried. A blank name never claims it.
      */
     private var saveInFlight = false
 
@@ -82,7 +82,15 @@ class CollectionEditActivity : SentinelActivity() {
         setSupportActionBar(binding.toolbarCollectionDetails)
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
 
-        checkIntent()
+        // #500: take the handoff only on the first admission. The
+        // ViewModel survives an in-process recreation and already holds
+        // the collection, the key list, and the name draft. A process
+        // death builds a new ViewModel, so checkIntent runs again and the
+        // spent token still degrades to the stored keys.
+        if (!viewModel.isEditorAdmitted()) {
+            viewModel.admitEditor()
+            checkIntent()
+        }
 
 
         viewModel.getCollection().observe(this) {
@@ -90,8 +98,14 @@ class CollectionEditActivity : SentinelActivity() {
             // live collection published an unconfirmed name (Back could
             // not drop it; the next sync persisted it) and a Save that
             // re-emitted this LiveData rebound the screen mid-tap.
-            binding.collectionEdiText.setText(it.collectionLabel.trimEnd())
+            // A recreation shows the draft captured with the activity,
+            // not the stored label.
+            val draft = viewModel.nameDraft()
+            binding.collectionEdiText.setText(draft ?: it.collectionLabel.trimEnd())
             pubKeyAdapter.setIsImportFromWallet(it.isImportFromWallet)
+            if (it.isImportFromWallet) {
+                binding.addNewPubFab.visibility = View.GONE
+            }
             setUpPubKeyList()
         }
 
@@ -229,6 +243,7 @@ class CollectionEditActivity : SentinelActivity() {
         val apiService: ApiService by inject(ApiService::class.java)
 
         if (newPubKey != null) {
+            viewModel.recordImportRequest()
             if (newPubKey.type == AddressTypes.ADDRESS) {
                 apiScope.launch {
                     try {
@@ -532,6 +547,9 @@ class CollectionEditActivity : SentinelActivity() {
      * stays in the field and is dropped with the screen. A blank name
      * is rejected and the screen stays, and Save can be tried again.
      * A second tap after a valid Save does not persist again.
+     * RESULT_OK and finish happen only after an add or an update. If the
+     * collection or the key list is not ready, or the write throws, the
+     * screen stays open and the latch is released.
      */
     private fun commitDraftAndClose() {
         val draft = binding.collectionEdiText.text?.toString()?.trim().orEmpty()
@@ -546,22 +564,28 @@ class CollectionEditActivity : SentinelActivity() {
         if (saveInFlight) return
         saveInFlight = true
         try {
-            val collection = viewModel.getCollection().value
-            if (collection == null) {
-                finish()
+            AndroidUtil.hideKeyboard(this)
+            if (!viewModel.save(draft)) {
+                saveInFlight = false
                 return
             }
-            AndroidUtil.hideKeyboard(this)
-            collection.collectionLabel = draft
-            viewModel.save()
+            val collection = viewModel.getCollection().value
             setResult(Activity.RESULT_OK, Intent().apply {
-                if (collection.id.isNotEmpty()) putExtra("collection", collection.id)
+                val id = collection?.id.orEmpty()
+                if (id.isNotEmpty()) putExtra("collection", id)
             })
             finish()
         } catch (failure: Throwable) {
             saveInFlight = false
             throw failure
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        if (::binding.isInitialized) {
+            viewModel.rememberNameDraft(binding.collectionEdiText.text?.toString().orEmpty())
+        }
+        super.onSaveInstanceState(outState)
     }
 
     private fun deleteCollection() {

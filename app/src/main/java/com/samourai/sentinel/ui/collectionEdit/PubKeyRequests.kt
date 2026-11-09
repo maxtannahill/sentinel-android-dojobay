@@ -34,5 +34,13 @@ object PubKeyRequests {
     /** Returns and removes the request; null for an unknown or reused token. */
     fun take(token: String?): Request? = token?.let { pending.remove(it) }
 
+    internal fun contains(token: String?): Boolean =
+        token != null && pending.containsKey(token)
+
+    /** Puts [pubKeyModel] back under a known token. Tests use this to see a second take. */
+    internal fun putAt(token: String, pubKeyModel: PubKeyModel) {
+        pending[token] = Request(pubKeyModel)
+    }
+
     internal fun clear() = pending.clear()
 }
