@@ -12,9 +12,13 @@ import com.samourai.sentinel.ui.dojo.DojoPairing
 import com.samourai.sentinel.ui.dojo.DojoUtility
 import com.samourai.sentinel.ui.utils.PrefsUtil
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import okhttp3.Authenticator
+import okhttp3.OkHttpClient
 import okhttp3.Response
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -24,7 +28,9 @@ import org.junit.After
 import org.junit.AfterClass
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -43,6 +49,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * #470. /auth/login used to be built with [TokenAuthenticator] attached.
@@ -108,11 +115,15 @@ class DojoAuthLoginLoopTest {
         prefs.enableTor = false
         setApiKey("rotated-key")
         seen.clear()
+        if (this::api.isInitialized) {
+            api.beforeNewCall = null
+        }
     }
 
     @After
     fun tearDown() {
         if (this::api.isInitialized) {
+            api.beforeNewCall = null
             api.client.dispatcher.executorService.shutdown()
             api.client.connectionPool.evictAll()
         }
@@ -288,6 +299,93 @@ class DojoAuthLoginLoopTest {
         } finally {
             held.responses.forEach { it.close() }
         }
+    }
+
+    /**
+     * Login installs a client with no authenticator, then calls newCall.
+     * A wallet request in that gap used to replace the shared field with
+     * an authenticator client. The login's 401 then joined the refresh
+     * flight the login itself was running, and waited out the call
+     * timeout. The call now keeps the client it captured: one rejected
+     * login, refresh returns false, and nothing posts a second login.
+     */
+    @Test(timeout = 15_000)
+    fun `login fails once when a wallet call replaces the client before newCall`() {
+        val loginPaused = CountDownLatch(1)
+        val walletReplaced = CountDownLatch(1)
+        val releaseLogin = CountDownLatch(1)
+        val releaseWallet = CountDownLatch(1)
+        val loginClient = AtomicReference<OkHttpClient>()
+        server.dispatcher = dispatcher { request ->
+            val path = request.path.orEmpty()
+            when {
+                path.startsWith("/auth/login") ->
+                    MockResponse().setResponseCode(401).setBody("denied")
+                path.startsWith("/wallet") ->
+                    MockResponse().setResponseCode(200).setBody("""{"status":"ok"}""")
+                else -> error("unexpected $path")
+            }
+        }
+        api.beforeNewCall = { http, request ->
+            val path = request.url.encodedPath
+            if (path.startsWith("/auth/login") && loginClient.compareAndSet(null, http)) {
+                loginPaused.countDown()
+                if (!releaseLogin.await(5, TimeUnit.SECONDS)) {
+                    throw AssertionError("login was not released")
+                }
+            } else if (path.startsWith("/wallet")) {
+                walletReplaced.countDown()
+                if (!releaseWallet.await(5, TimeUnit.SECONDS)) {
+                    throw AssertionError("wallet call was not released")
+                }
+            }
+        }
+
+        val refreshed = runBlocking {
+            val login = async(Dispatchers.IO) { api.refreshDojoAuth() }
+            try {
+                assertTrue(loginPaused.await(5, TimeUnit.SECONDS))
+                val captured = loginClient.get()
+                assertEquals(Authenticator.NONE, captured.authenticator)
+                val wallet = async(Dispatchers.IO) { api.getWallet("xpub-test") }
+                try {
+                    assertTrue(walletReplaced.await(5, TimeUnit.SECONDS))
+                    assertNotSame(captured, api.client)
+                    assertTrue(api.client.authenticator is TokenAuthenticator)
+                    releaseLogin.countDown()
+                    val result = try {
+                        withTimeout(5_000) { login.await() }
+                    } catch (e: TimeoutCancellationException) {
+                        fail("login waited on its own re-auth flight")
+                        throw e
+                    }
+                    assertFalse(result)
+                    assertEquals(1, paths("/auth/login").size)
+                    assertEquals(0, paths("/auth/refresh").size)
+                    val loginHit = paths("/auth/login").single()
+                    assertTrue(loginHit.body.contains("apikey=rotated-key"))
+                    assertFalse(loginHit.path.contains("at="))
+                    releaseWallet.countDown()
+                    val walletResponse = withTimeout(5_000) { wallet.await() }
+                    try {
+                        assertEquals(200, walletResponse.code)
+                    } finally {
+                        walletResponse.close()
+                    }
+                    result
+                } finally {
+                    releaseWallet.countDown()
+                }
+            } finally {
+                releaseLogin.countDown()
+            }
+        }
+        assertFalse(refreshed)
+        assertEquals(1, paths("/auth/login").size)
+        assertEquals(1, paths("/wallet").size)
+        api.beforeNewCall = null
+        loginClient.get()?.dispatcher?.executorService?.shutdown()
+        loginClient.get()?.connectionPool?.evictAll()
     }
 
     /**
