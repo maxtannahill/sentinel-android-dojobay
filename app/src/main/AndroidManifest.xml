@@ -103,7 +103,8 @@
             android:label=""
             android:exported="false"
             android:screenOrientation="portrait"
-            android:theme="@style/AppThemeV3" />
+            android:theme="@style/AppThemeV3"
+            android:windowSoftInputMode="adjustNothing" />
         <activity
             android:name=".ui.broadcast.BroadcastTx"
             android:label=""

@@ -3,16 +3,17 @@ package com.samourai.sentinel.ui.collectionEdit
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Rect
 import android.os.Bundle
 import android.view.Menu
 import android.view.MenuItem
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.viewModels
 import androidx.core.widget.NestedScrollView
-import androidx.core.widget.doOnTextChanged
 import androidx.lifecycle.Observer
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -66,6 +67,14 @@ class CollectionEditActivity : SentinelActivity() {
     private var pressedX: Float = 0.0F
     private var pressedY: Float = 0.0F
 
+    /**
+     * Claimed only after the name validates, and held through a successful
+     * save so a second tap cannot add the collection again. Released if
+     * saving throws or nothing was written, so a failed attempt can be
+     * retried. A blank name never claims it.
+     */
+    private var saveInFlight = false
+
     override fun onCreateAdmitted(savedInstanceState: Bundle?) {
         binding = ActivityCollectionEditBinding.inflate(layoutInflater)
         val view = binding.root
@@ -73,16 +82,31 @@ class CollectionEditActivity : SentinelActivity() {
         setSupportActionBar(binding.toolbarCollectionDetails)
         supportActionBar?.setDisplayHomeAsUpEnabled(true)
 
-        checkIntent()
+        // #500: take the handoff only on the first admission. The
+        // ViewModel survives an in-process recreation and already holds
+        // the collection, the key list, and the name draft. A process
+        // death builds a new ViewModel, so checkIntent runs again and the
+        // spent token still degrades to the stored keys.
+        if (!viewModel.isEditorAdmitted()) {
+            viewModel.admitEditor()
+            checkIntent()
+        }
 
 
         viewModel.getCollection().observe(this) {
-            binding.collectionEdiText.setText(it.collectionLabel.trimEnd())
+            // The name field is a draft. Writing each keystroke onto the
+            // live collection published an unconfirmed name (Back could
+            // not drop it; the next sync persisted it) and a Save that
+            // re-emitted this LiveData rebound the screen mid-tap.
+            // A recreation shows the draft captured with the activity,
+            // not the stored label.
+            val draft = viewModel.nameDraft()
+            binding.collectionEdiText.setText(draft ?: it.collectionLabel.trimEnd())
             pubKeyAdapter.setIsImportFromWallet(it.isImportFromWallet)
-            setUpPubKeyList()
-            binding.collectionEdiText.doOnTextChanged { text, _, _, _ ->
-                it.collectionLabel = text.toString()
+            if (it.isImportFromWallet) {
+                binding.addNewPubFab.visibility = View.GONE
             }
+            setUpPubKeyList()
         }
 
 
@@ -92,7 +116,7 @@ class CollectionEditActivity : SentinelActivity() {
 
         viewModel.message.observe(this, Observer {
             if (it != null) {
-                if (it.isEmpty()) {
+                if (it.isEmpty() || isFinishing) {
                     return@Observer
                 }
                 AndroidUtil.hideKeyboard(this)
@@ -219,6 +243,7 @@ class CollectionEditActivity : SentinelActivity() {
         val apiService: ApiService by inject(ApiService::class.java)
 
         if (newPubKey != null) {
+            viewModel.recordImportRequest()
             if (newPubKey.type == AddressTypes.ADDRESS) {
                 apiScope.launch {
                     try {
@@ -267,16 +292,26 @@ class CollectionEditActivity : SentinelActivity() {
         }
     }
 
-    override fun onBackPressed() {
-        if (binding.collectionEdiText.text.isNullOrEmpty() || binding.collectionEdiText.text.isBlank()) {
-            this@CollectionEditActivity.showFloatingSnackBar(
-                binding.collectionEdiText.parent as ViewGroup,
-                text = "Please enter collection label",
-                duration = Snackbar.LENGTH_SHORT
-            )
-            return
+    /**
+     * The name field keeps focus after an edit, so the first Save tap is
+     * also the tap that dismisses the keyboard. Clearing focus here, on
+     * the same DOWN, lets that gesture reach the toolbar action. The
+     * activity's adjustNothing mode keeps the hide from resizing the
+     * window and cancelling the click.
+     */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.action == MotionEvent.ACTION_DOWN) {
+            val focused = currentFocus
+            if (focused is EditText) {
+                val rect = Rect()
+                focused.getGlobalVisibleRect(rect)
+                if (!rect.contains(ev.rawX.toInt(), ev.rawY.toInt())) {
+                    focused.clearFocus()
+                    AndroidUtil.hideKeyboard(this)
+                }
+            }
         }
-        super.onBackPressed()
+        return super.dispatchTouchEvent(ev)
     }
 
     private fun setUpPubKeyList() {
@@ -496,16 +531,7 @@ class CollectionEditActivity : SentinelActivity() {
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean {
         if (item.itemId == R.id.saveCollectionMenuItem || item.itemId == android.R.id.home) {
-            if (binding.collectionEdiText.text.isNullOrEmpty() || binding.collectionEdiText.text.isBlank()) {
-                this@CollectionEditActivity.showFloatingSnackBar(
-                    binding.collectionEdiText.parent as ViewGroup,
-                    text = "Please enter collection label",
-                    duration = Snackbar.LENGTH_SHORT
-                )
-            } else {
-                viewModel.save()
-                this.finish()
-            }
+            commitDraftAndClose()
         }
         else if (item.itemId == R.id.deleteCollection) {
             deleteCollection()
@@ -513,6 +539,53 @@ class CollectionEditActivity : SentinelActivity() {
         else
             return super.onOptionsItemSelected(item)
         return true
+    }
+
+    /**
+     * One Save writes the draft name onto the live collection, persists
+     * it, and leaves. Back never reaches this, so an unconfirmed name
+     * stays in the field and is dropped with the screen. A blank name
+     * is rejected and the screen stays, and Save can be tried again.
+     * A second tap after a valid Save does not persist again.
+     * RESULT_OK and finish happen only after an add or an update. If the
+     * collection or the key list is not ready, or the write throws, the
+     * screen stays open and the latch is released.
+     */
+    private fun commitDraftAndClose() {
+        val draft = binding.collectionEdiText.text?.toString()?.trim().orEmpty()
+        if (draft.isEmpty()) {
+            this@CollectionEditActivity.showFloatingSnackBar(
+                binding.collectionEdiText.parent as ViewGroup,
+                text = "Please enter collection label",
+                duration = Snackbar.LENGTH_SHORT
+            )
+            return
+        }
+        if (saveInFlight) return
+        saveInFlight = true
+        try {
+            AndroidUtil.hideKeyboard(this)
+            if (!viewModel.save(draft)) {
+                saveInFlight = false
+                return
+            }
+            val collection = viewModel.getCollection().value
+            setResult(Activity.RESULT_OK, Intent().apply {
+                val id = collection?.id.orEmpty()
+                if (id.isNotEmpty()) putExtra("collection", id)
+            })
+            finish()
+        } catch (failure: Throwable) {
+            saveInFlight = false
+            throw failure
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        if (::binding.isInitialized) {
+            viewModel.rememberNameDraft(binding.collectionEdiText.text?.toString().orEmpty())
+        }
+        super.onSaveInstanceState(outState)
     }
 
     private fun deleteCollection() {
