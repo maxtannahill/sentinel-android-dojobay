@@ -41,6 +41,7 @@ import com.samourai.sentinel.ui.views.GenericBottomSheet
 import com.samourai.sentinel.ui.views.alertWithInput
 import com.samourai.sentinel.util.ExportImportUtil
 import com.samourai.sentinel.util.FormatsUtil
+import com.samourai.sentinel.util.ImportLimits
 import com.samourai.wallet.util.PrivKeyReader
 import com.samourai.wallet.util.XPUB
 import com.sparrowwallet.hummingbird.URDecoder
@@ -293,6 +294,10 @@ class AddNewPubKeyBottomSheet : GenericBottomSheet {
     }
 
     private fun validate(code: String): Boolean {
+        if (ImportLimits.exceedsSensitivePaste(code)) {
+            Toast.makeText(context, "Invalid public key or payload", Toast.LENGTH_LONG).show()
+            return false
+        }
         // #297: trim once, before anything reads the input. A key pasted from
         // a message or a text file carries leading or trailing whitespace, and
         // every check below used to see the raw string: extractPublicKey()

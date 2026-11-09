@@ -14,7 +14,9 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.zip.GZIPOutputStream;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -117,6 +119,46 @@ public class PSBTReadTest {
         assertRejected(concat(three, new byte[] {0x00}), "Trailing");
         assertRejected(concat(fixture.bytes, new byte[] {0x00}), "Trailing");
         assertRejected(concat(fixture.bytes, kv((byte) 0x02, null, new byte[] {0x11})), "Trailing");
+    }
+
+    @Test
+    public void readCompactInt_readsUnsignedLengths() throws Exception {
+        assertEquals(40_000, PSBT.readCompactInt(ByteBuffer.wrap(PSBT.writeCompactInt(40_000))));
+        assertEquals(65_535, PSBT.readCompactInt(ByteBuffer.wrap(PSBT.writeCompactInt(65_535))));
+        assertEquals(Integer.MAX_VALUE, PSBT.readCompactInt(ByteBuffer.wrap(PSBT.writeCompactInt(Integer.MAX_VALUE))));
+    }
+
+    @Test
+    public void read_hugeDeclaredLengthsAreRejectedBeforeAllocation() {
+        assertRejected(Hex.decode("70736274fffe00000080"), "Data too long");
+        assertRejected(Hex.decode("70736274ffffffff00000000000000"), "Data too long");
+        assertRejected(Hex.decode("70736274fffeffffff7f"), "Truncated");
+        assertRejected(Hex.decode("70736274ff01fc0a00"), "Truncated");
+    }
+
+    @Test
+    public void read_fortyThousandByteFieldStillParses() throws Exception {
+        Fixture fixture = fixture();
+        byte[] value = new byte[40_000];
+        value[0] = 0x11;
+        value[39_999] = 0x22;
+        byte[] withField = insert(fixture.bytes, globalSeparator(fixture.bytes),
+                kv((byte) 0xFC, null, value));
+        PSBT parsed = PSBT.fromBytes(withField, PARAMS);
+        assertTrue(parsed.isParseOK());
+        assertArrayEquals(fixture.tx.bitcoinSerialize(), parsed.getTransaction().bitcoinSerialize());
+    }
+
+    @Test
+    public void fromBytes_gzipRoundTripDropsNewlinesAndRejectsInflationPastTheCap() throws Exception {
+        Fixture fixture = fixture();
+        String hex = Hex.toHexString(fixture.bytes);
+        String withNewline = hex.substring(0, 8) + "\n" + hex.substring(8);
+        PSBT parsed = PSBT.fromBytes(gzip(withNewline.getBytes("UTF-8")), PARAMS);
+        assertTrue(parsed.isParseOK());
+        assertArrayEquals(fixture.tx.bitcoinSerialize(), parsed.getTransaction().bitcoinSerialize());
+
+        assertRejected(gzip(new byte[PSBT.MAX_TEXT_CHARS + 1]), "Data too long");
     }
 
     @Test
@@ -268,6 +310,14 @@ public class PSBTReadTest {
                 return value;
             }
         }
+    }
+
+    private static byte[] gzip(byte[] raw) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        GZIPOutputStream gzip = new GZIPOutputStream(out);
+        gzip.write(raw);
+        gzip.close();
+        return out.toByteArray();
     }
 
     private static byte[] kv(byte type, byte[] keyData, byte[] value) throws Exception {
