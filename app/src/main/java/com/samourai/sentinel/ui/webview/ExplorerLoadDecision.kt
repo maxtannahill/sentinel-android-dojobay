@@ -46,3 +46,15 @@ fun explorerLoadDecision(
         else ExplorerLoadDecision.LOAD_DIRECT
     else -> ExplorerLoadDecision.WAIT_FOR_TOR
 }
+
+/**
+ * Tor was required and this screen has not loaded a page yet. STARTING
+ * still waits ([explorerLoadDecision] returns [ExplorerLoadDecision.WAIT_FOR_TOR]).
+ * If Tor then reports off, that is the same block as opening while Tor
+ * is already off. A page that already loaded is left as it is.
+ */
+fun explorerWhenTorStopsBeforeLoad(
+    torRequired: Boolean,
+    pageLoaded: Boolean,
+): ExplorerLoadDecision? =
+    if (torRequired && !pageLoaded) ExplorerLoadDecision.BLOCK_TOR_OFF else null

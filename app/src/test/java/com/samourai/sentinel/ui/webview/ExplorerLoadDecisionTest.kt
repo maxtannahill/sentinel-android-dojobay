@@ -74,6 +74,20 @@ class ExplorerLoadDecisionTest {
     }
 
     @Test
+    fun `tor that stops before a load is the same block as opening while off`() {
+        assertEquals(
+            ExplorerLoadDecision.BLOCK_TOR_OFF,
+            explorerWhenTorStopsBeforeLoad(torRequired = true, pageLoaded = false)
+        )
+    }
+
+    @Test
+    fun `tor stopping does not disturb a page that already loaded or an optional session`() {
+        assertEquals(null, explorerWhenTorStopsBeforeLoad(torRequired = true, pageLoaded = true))
+        assertEquals(null, explorerWhenTorStopsBeforeLoad(torRequired = false, pageLoaded = false))
+    }
+
+    @Test
     fun `optional tor on unsupported device offers an explicit direct choice`() {
         val d = explorerLoadDecision(proxyOverrideSupported = false, torReady = false, torOff = true, torRequired = false)
         assertEquals(ExplorerLoadDecision.OFFER_DIRECT_UNSUPPORTED, d)
