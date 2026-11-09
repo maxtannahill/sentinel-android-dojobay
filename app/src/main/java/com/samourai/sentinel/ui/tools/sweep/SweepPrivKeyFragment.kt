@@ -678,9 +678,34 @@ class PreviewBottomSheet : GenericBottomSheet() {
         }
 
         binding.sweepBtn.setOnClickListener {
-            val hexTx = broadcastTx()
-            var response: String? = null
             apiScope.launch {
+                // #477 (leg 4): verify every claimed utxo against the chain
+                // before any tx is built or signed. broadcastTx() itself is
+                // unchanged - its build+sign now waits for this gate on
+                // Dispatchers.Default, and a refusal never reaches the
+                // broadcast arm.
+                try {
+                    verifySweepUtxos(utxoList, SentinelState.getNetworkParam()) { txid ->
+                        fetchPrevTxHexViaApi(apiService, txid)
+                    }
+                } catch (e: SweepUtxoVerificationException) {
+                    Timber.e(e, "Sweep refused: a UTXO failed chain verification")
+                    if (isAdded && activity != null) {
+                        requireActivity().runOnUiThread {
+                            view?.findViewById<ConstraintLayout>(
+                                R.id.sweepPreviewCircularProgress
+                            )?.visibility = View.GONE
+                            Toast.makeText(
+                                context,
+                                "Sweep aborted: a coin failed verification",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                    return@launch
+                }
+                val hexTx = withContext(Dispatchers.Default) { broadcastTx() }
+                var response: String? = null
                 try {
                     response = apiService.broadcast(hexTx!!)
                 } catch (e: ApiService.ApiNotConfigured) {
