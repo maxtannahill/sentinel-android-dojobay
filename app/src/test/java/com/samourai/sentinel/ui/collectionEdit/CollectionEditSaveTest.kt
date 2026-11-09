@@ -20,6 +20,7 @@ import com.samourai.sentinel.ui.utils.PrefsUtil
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -67,6 +68,7 @@ class CollectionEditSaveTest {
         prefs.pinKeyMaterial = ""
         prefs.pinEnabled = false
         repository = CollectionRepository()
+        PubKeyRequests.clear()
         startKoin {
             androidContext(app)
             modules(
@@ -87,6 +89,7 @@ class CollectionEditSaveTest {
         if (GlobalContext.getOrNull() != null) {
             stopKoin()
         }
+        PubKeyRequests.clear()
         val app = ApplicationProvider.getApplicationContext<Application>()
         val access = AccessFactory.getInstance(app)
         if (savedAdmitted) access.admitSession() else {
@@ -210,9 +213,17 @@ class CollectionEditSaveTest {
         return launch(Intent().putExtra("collection", id))
     }
 
+    // #484: the Intent carries only the single-use token. The old "pubKey"
+    // Parcelable extra is not read, so handing the model that way leaves
+    // the key list empty and save() stores nothing.
     private fun launchNew(): CollectionEditActivity {
         val key = PubKeyModel(pubKey = "zpub-fresh", label = "Savings", type = AddressTypes.BIP84)
-        return launch(Intent().putExtra("pubKey", key))
+        val token = PubKeyRequests.put(key)
+        val activity = launch(
+            Intent().putExtra(CollectionEditActivity.EXTRA_PUBKEY_TOKEN, token)
+        )
+        assertNull(PubKeyRequests.take(token))
+        return activity
     }
 
     private fun launch(intent: Intent): CollectionEditActivity {
