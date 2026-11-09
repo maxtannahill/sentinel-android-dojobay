@@ -67,6 +67,7 @@ import timber.log.Timber
 import java.io.FileNotFoundException
 import java.io.IOException
 import java.text.SimpleDateFormat
+import java.util.IdentityHashMap
 import java.util.Locale
 
 class ImportBackUpActivity : SentinelActivity() {
@@ -1459,8 +1460,10 @@ class ImportBackUpActivity : SentinelActivity() {
      * every sibling, so TalkBack can reach the import controls and, on
      * the confirm step, the set pad's keys and its confirm control.
      * While a pad is showing, every other child of the content root is
-     * hidden. Closing that pad puts the layer under it back.
+     * hidden. Closing that pad puts each child's own mode back.
      */
+    private val accessibilityBeforePad = IdentityHashMap<View, Int>()
+
     private fun schedulePadAccessibilitySync() {
         syncPadAccessibility()
         if (!::binding.isInitialized) return
@@ -1473,20 +1476,38 @@ class ImportBackUpActivity : SentinelActivity() {
         if (!::binding.isInitialized || isDestroyed) return
         val content = findViewById<ViewGroup>(android.R.id.content) ?: return
         val top = topmostShowingPad()
-        for (i in 0 until content.childCount) {
-            val child = content.getChildAt(i)
-            hideFromAccessibility(child, hidden = top != null && child !== top)
-        }
-        // A pad hosted in its own window is not one of those children.
-        // The loop already hid the import screen. Hide every other pad
-        // and leave the one on top reachable.
-        if (top != null && top.parent !== content) {
-            for (tag in padTagsBottomToTop()) {
-                val view = showingPadView(tag) ?: continue
-                if (view === top || view.parent === content) continue
-                hideFromAccessibility(view, hidden = true)
+        val cover = LinkedHashSet<View>()
+        if (top != null) {
+            for (i in 0 until content.childCount) {
+                val child = content.getChildAt(i)
+                if (child !== top) cover.add(child)
             }
-            hideFromAccessibility(top, hidden = false)
+            // A pad hosted in its own window is not one of those children.
+            // The loop already hid the import screen. Hide every other pad
+            // and leave the one on top reachable.
+            if (top.parent !== content) {
+                for (tag in padTagsBottomToTop()) {
+                    val view = showingPadView(tag) ?: continue
+                    if (view === top || view.parent === content) continue
+                    cover.add(view)
+                }
+            }
+        }
+        val uncover = ArrayList<View>()
+        for (view in accessibilityBeforePad.keys) {
+            if (view !in cover) uncover.add(view)
+        }
+        for (view in uncover) {
+            val mode = accessibilityBeforePad.remove(view) ?: continue
+            view.importantForAccessibility = mode
+        }
+        for (view in cover) {
+            // A later sync must not record the mode this pad just wrote.
+            if (!accessibilityBeforePad.containsKey(view)) {
+                accessibilityBeforePad[view] = view.importantForAccessibility
+            }
+            view.importantForAccessibility =
+                View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
         }
     }
 
@@ -1512,12 +1533,6 @@ class ImportBackUpActivity : SentinelActivity() {
         TAG_RESTORE_PIN_CONFIRM,
     )
 
-    private fun hideFromAccessibility(view: View, hidden: Boolean) {
-        view.importantForAccessibility =
-            if (hidden) View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-            else View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
-    }
-
     override fun onStart() {
         super.onStart()
         // A pad restored with the activity does not always emit a view
@@ -1535,6 +1550,7 @@ class ImportBackUpActivity : SentinelActivity() {
 
     override fun onDestroy() {
         supportFragmentManager.unregisterFragmentLifecycleCallbacks(importPadLifecycle)
+        accessibilityBeforePad.clear()
         // #358: the import derive blocks on IO. viewModelScope is
         // cancelled only after that returns, so drop the overlay with
         // the window. Also covers the decrypt wait (#355). Safe if the

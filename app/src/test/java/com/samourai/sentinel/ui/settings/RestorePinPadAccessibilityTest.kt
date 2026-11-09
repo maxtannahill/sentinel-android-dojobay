@@ -197,6 +197,56 @@ class RestorePinPadAccessibilityTest {
     }
 
     @Test
+    fun alreadyHiddenOrExcludedSiblingKeepsItsAccessibilityMode() {
+        val activity = launch()
+        val content = activity.findViewById<ViewGroup>(android.R.id.content)
+        val excluded = View(activity)
+        excluded.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        val alreadyHidden = View(activity)
+        alreadyHidden.importantForAccessibility =
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        val explicit = View(activity)
+        explicit.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        content.addView(excluded)
+        content.addView(alreadyHidden)
+        content.addView(explicit)
+
+        val dialog = LockScreenDialog.newInstance(
+            message = "Enter pin code",
+            requestKey = ImportBackUpActivity.REQUEST_KEY_IMPORT_PIN,
+            purpose = LockScreenDialog.PURPOSE_IMPORT,
+        )
+        activity.supportFragmentManager.beginTransaction()
+            .add(android.R.id.content, dialog, ImportBackUpActivity.TAG_IMPORT_PIN)
+            .commit()
+        idle()
+
+        assertEquals(
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            excluded.importantForAccessibility,
+        )
+        assertEquals(
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            alreadyHidden.importantForAccessibility,
+        )
+        assertEquals(
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            explicit.importantForAccessibility,
+        )
+        assertImportContentExposed(activity, exposed = false)
+
+        dialog.dismiss()
+        idle()
+        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_NO, excluded.importantForAccessibility)
+        assertEquals(
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            alreadyHidden.importantForAccessibility,
+        )
+        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_YES, explicit.importantForAccessibility)
+        assertImportContentExposed(activity, exposed = true)
+    }
+
+    @Test
     fun backspaceOnTheSharedKeypadUsesTheLocalizedName() {
         val activity = launch()
         val keypad = PinEntryView(activity)
