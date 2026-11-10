@@ -253,16 +253,10 @@ class BroadcastTx : SentinelActivity() {
                 ImportLimits.requireBytesWithin(it, ImportLimits.TX_MAX_DECODED_BYTES)
             }
         } catch (tooLarge: ImportTooLargeException) {
-            withContext(Dispatchers.Main) {
-                Toast.makeText(applicationContext, tooLarge.message, Toast.LENGTH_LONG).show()
-                disableBtn(binding.broadCastTransactionBtn, false)
-            }
+            rejectInput(tooLarge.message ?: errorText)
             return
         } catch (ex: Exception) {
-            withContext(Dispatchers.Main) {
-                Toast.makeText(applicationContext, errorText, Toast.LENGTH_LONG).show()
-                disableBtn(binding.broadCastTransactionBtn, false)
-            }
+            rejectInput(errorText)
             return
         }
         try {
@@ -287,25 +281,25 @@ class BroadcastTx : SentinelActivity() {
                     "PSBT detected — Broadcast needs the signed raw " +
                     "transaction. Export the finalized transaction from " +
                     "your signer."
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(
-                        applicationContext,
-                        psbtText,
-                        Toast.LENGTH_LONG
-                    ).show()
-                    disableBtn(binding.broadCastTransactionBtn, false)
-                }
+                rejectInput(psbtText)
                 return
             } catch (ex: Exception) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(
-                        applicationContext,
-                        errorText,
-                        Toast.LENGTH_LONG
-                    ).show()
-                    disableBtn(binding.broadCastTransactionBtn, false)
-                }
+                rejectInput(errorText)
             }
+        }
+    }
+
+    /**
+     * The rejected payload was an attempt to replace the field. Drop the
+     * previous transaction and leave BROADCAST disabled.
+     */
+    private suspend fun rejectInput(message: String) {
+        val rejected = rejectedBroadcastEntry()
+        withContext(Dispatchers.Main) {
+            Toast.makeText(applicationContext, message, Toast.LENGTH_LONG).show()
+            binding.hexTextView.text = rejected.text
+            model.setHex(rejected.text)
+            disableBtn(binding.broadCastTransactionBtn, rejected.broadcastEnabled)
         }
     }
 

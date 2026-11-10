@@ -17,6 +17,7 @@ import com.samourai.sentinel.util.apiScope
 import com.samourai.wallet.api.backend.beans.UnspentOutput
 import com.samourai.wallet.api.backend.beans.WalletResponse
 import com.samourai.wallet.util.XPUB
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -45,7 +46,30 @@ open class ApiService {
     private val dojoUtility: DojoUtility by inject(DojoUtility::class.java);
     private var ACCESS_TOKEN: String? = null
     private val ACCESS_TOKEN_REFRESH = 300L
+
+    /**
+     * One in-flight [refreshDojoAuth] for this service. A pull-to-refresh
+     * fans out several Dojo calls; each 401 used to run its own refresh
+     * and then its own login (#470).
+     */
+    private val refreshLock = Any()
+    private var refreshInFlight: CompletableDeferred<Boolean>? = null
+
+    /**
+     * The client most recently built for this service. A request must not
+     * read it back: the next build replaces it, and the replacement can
+     * carry a different authenticator (#470).
+     */
+    @Volatile
     lateinit var client: OkHttpClient
+
+    /**
+     * Runs after a request has captured its client and before
+     * [OkHttpClient.newCall]. The Dojo login interleaving test pauses
+     * here. Null in production.
+     */
+    @Volatile
+    internal var beforeNewCall: ((OkHttpClient, Request) -> Unit)? = null
     private val  JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     private val HARDENED = 2147483648
 
@@ -63,14 +87,29 @@ open class ApiService {
     }
 
 
-    private fun buildClient(excludeApiKey: Boolean = false, excludeAuthenticator: Boolean = false) {
-        client = buildClient(
+    private fun buildClient(
+        excludeApiKey: Boolean = false,
+        excludeAuthenticator: Boolean = false,
+    ): OkHttpClient {
+        val built = buildClient(
             excludeApiKey,
             getAPIUrl(),
             this,
             prefsUtil.authorization,
             excludeAuthenticator
         )
+        client = built
+        return built
+    }
+
+    /**
+     * [captured] is the client this request just built. The hook runs
+     * before [OkHttpClient.newCall] so a concurrent build can replace
+     * [client] in between; this call still uses [captured].
+     */
+    private suspend fun callOn(captured: OkHttpClient, request: Request): Response {
+        beforeNewCall?.invoke(captured, request)
+        return captured.newCall(request).await()
     }
 
 
@@ -115,8 +154,49 @@ open class ApiService {
      *
      * Deliberately blocking: [TokenAuthenticator] runs on an OkHttp thread and
      * must have a valid token before it can return the retried request.
+     *
+     * Callers that arrive while a refresh is already running wait for it.
+     * They then retry with the token that attempt stored, or fail with it,
+     * instead of each posting another /auth/refresh and /auth/login.
      */
-    suspend fun refreshDojoAuth(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun refreshDojoAuth(): Boolean {
+        val claim = claimRefreshFlight()
+        if (!claim.leader) {
+            return claim.flight.await()
+        }
+        return try {
+            val result = withContext(Dispatchers.IO) { performDojoRefresh() }
+            claim.flight.complete(result)
+            result
+        } catch (t: Throwable) {
+            claim.flight.completeExceptionally(t)
+            throw t
+        } finally {
+            synchronized(refreshLock) {
+                if (refreshInFlight === claim.flight) {
+                    refreshInFlight = null
+                }
+            }
+        }
+    }
+
+    private fun claimRefreshFlight(): RefreshClaim = synchronized(refreshLock) {
+        val existing = refreshInFlight
+        if (existing != null) {
+            RefreshClaim(leader = false, flight = existing)
+        } else {
+            val created = CompletableDeferred<Boolean>()
+            refreshInFlight = created
+            RefreshClaim(leader = true, flight = created)
+        }
+    }
+
+    private data class RefreshClaim(
+        val leader: Boolean,
+        val flight: CompletableDeferred<Boolean>,
+    )
+
+    private suspend fun performDojoRefresh(): Boolean {
         // 1. Preferred: exchange the refresh token.
         val refreshToken = prefsUtil.refreshToken
         if (!refreshToken.isNullOrEmpty()) {
@@ -126,7 +206,7 @@ open class ApiService {
                 if (response.isSuccessful && body != null && body.contains("authorizations")) {
                     dojoUtility.setAuthToken(body)
                     Timber.i("Dojo token refreshed via /auth/refresh")
-                    return@withContext true
+                    return true
                 }
                 Timber.w("Dojo /auth/refresh rejected (code ${response.code}); trying API key")
             } catch (e: Exception) {
@@ -138,7 +218,7 @@ open class ApiService {
         val apiKey = dojoUtility.getApiKey()
         if (apiKey.isNullOrEmpty()) {
             Timber.e("Cannot re-authenticate with Dojo: no refresh token and no API key")
-            return@withContext false
+            return false
         }
 
         try {
@@ -147,13 +227,13 @@ open class ApiService {
             if (response.isSuccessful && body != null && body.contains("authorizations")) {
                 dojoUtility.setAuthToken(body)
                 Timber.i("Dojo token refreshed via /auth/login")
-                return@withContext true
+                return true
             }
             Timber.e("Dojo /auth/login rejected (code ${response.code})")
-            return@withContext false
+            return false
         } catch (e: Exception) {
             Timber.e(e, "Dojo /auth/login failed")
-            return@withContext false
+            return false
         }
     }
 
@@ -161,10 +241,12 @@ open class ApiService {
      * POST /auth/refresh - exchanges a refresh token for a new access token.
      *
      * excludeAuthenticator avoids recursing into [TokenAuthenticator] if this
-     * call itself returns 401.
+     * call itself returns 401. [authenticateDojo] does the same for
+     * /auth/login (#470). That login is the fallback in [refreshDojoAuth],
+     * so an authenticator on it calls this method again.
      */
     private suspend fun refreshDojoToken(refreshToken: String): Response {
-        buildClient(excludeApiKey = true, excludeAuthenticator = true)
+        val http = buildClient(excludeApiKey = true, excludeAuthenticator = true)
         val formBody = FormBody.Builder()
             .add("rt", refreshToken)
             .build()
@@ -172,16 +254,16 @@ open class ApiService {
             .post(formBody)
             .url("${getAPIUrl()}/auth/refresh")
             .build()
-        return client.newCall(request).await()
+        return callOn(http, request)
     }
 
 
     suspend fun checkImportStatus(pubKey: String) = withContext(Dispatchers.IO) {
-        buildClient(excludeAuthenticator = true)
+        val http = buildClient(excludeAuthenticator = true)
         val request = Request.Builder()
             .url("${getAPIUrl()}/xpub/${pubKey}/import/status")
             .build()
-        val response = client.newCall(request).await()
+        val response = callOn(http, request)
         val status = response.body?.string()
         if (!status.isNullOrEmpty()) {
             val json = JSONObject(status)
@@ -210,8 +292,8 @@ open class ApiService {
         if ((xpub.child + HARDENED).toString().equals("2147483646"))
             segwitValue = "bip84"
 
-        buildClient(excludeAuthenticator = true)
-        client.newBuilder()
+        val http = buildClient(excludeAuthenticator = true)
+        http.newBuilder()
             .connectTimeout(120, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
             .callTimeout(120, TimeUnit.SECONDS)
@@ -226,7 +308,7 @@ open class ApiService {
             .post(formBody)
             .build()
 
-        return client.newCall(request).await()
+        return callOn(http, request)
     }
 
     /**
@@ -243,13 +325,13 @@ open class ApiService {
      * paired to someone else's node.
      *
      * The response only comes back once the Dojo has finished scanning, hence
-     * the dedicated timeout - the shared client allows 60s, which a cold import
+     * the dedicated timeout - the ordinary client allows 60s, which a cold import
      * on a busy node routinely exceeds.
      */
     suspend fun rescanPubKey(pubKey: String, addressType: AddressTypes?): Response =
         withContext(Dispatchers.IO) {
-            buildClient(excludeAuthenticator = true)
-            val rescanClient = client.newBuilder()
+            val http = buildClient(excludeAuthenticator = true)
+            val rescanClient = http.newBuilder()
                 .connectTimeout(120, TimeUnit.SECONDS)
                 .readTimeout(RESCAN_TIMEOUT_MINUTES, TimeUnit.MINUTES)
                 .callTimeout(RESCAN_TIMEOUT_MINUTES, TimeUnit.MINUTES)
@@ -272,7 +354,7 @@ open class ApiService {
                 .post(formBody)
                 .build()
 
-            rescanClient.newCall(request).await()
+            callOn(rescanClient, request)
         }
 
     /**
@@ -309,8 +391,8 @@ open class ApiService {
 
     suspend fun importAddress(pubKey: String): Response {
 
-        buildClient(excludeAuthenticator = true)
-        client.newBuilder()
+        val http = buildClient(excludeAuthenticator = true)
+        http.newBuilder()
             .connectTimeout(120, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
             .callTimeout(120, TimeUnit.SECONDS)
@@ -324,13 +406,13 @@ open class ApiService {
             .post(formBody)
             .build()
 
-        return client.newCall(request).await()
+        return callOn(http, request)
     }
 
 
     suspend fun getTxHex(utxoHash: String): Response {
-        buildClient(excludeAuthenticator = true)
-        client.newBuilder()
+        val http = buildClient(excludeAuthenticator = true)
+        http.newBuilder()
             .connectTimeout(120, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
             .callTimeout(120, TimeUnit.SECONDS)
@@ -338,12 +420,24 @@ open class ApiService {
             .get()
             .url("${getAPIUrl()}/tx/$utxoHash/HEX")
             .build()
-        return client.newCall(request).await()
+        return callOn(http, request)
     }
 
 
     suspend fun authenticateDojo(apiKey: String): Response {
-        buildClient()
+        // #470: TokenAuthenticator's recovery is refreshDojoAuth, and the
+        // fallback there is this login. An authenticator on the login
+        // client turns a rejected /auth/login into another login. Each
+        // nested call is a new OkHttp chain, so the prior-response retry
+        // cap never fires and each level blocks a dispatcher thread.
+        // excludeApiKey: the access token on this call is the one that
+        // just failed. Sending it as `at` makes the login carry a stale
+        // credential. /auth/refresh already passes both flags.
+        // The client is the local from this build. Reading [client] again
+        // at newCall lets a wallet request install TokenAuthenticator in
+        // between, and a 401 then waits on the refresh flight this login
+        // is itself running.
+        val http = buildClient(excludeApiKey = true, excludeAuthenticator = true)
         val formBody = FormBody.Builder()
             .add("apikey", apiKey)
             .build()
@@ -351,34 +445,34 @@ open class ApiService {
             .post(formBody)
             .url("${getAPIUrl()}/auth/login")
             .build()
-        return client.newCall(request).await()
+        return callOn(http, request)
     }
 
 
     suspend fun getTx(txId: String): Response {
-        buildClient()
+        val http = buildClient()
         val request = Request.Builder()
             .url("${getAPIUrl()}/tx/${txId}?fees=1")
             .build()
-        return client.newCall(request).await()
+        return callOn(http, request)
     }
 
 
     suspend fun getFees(): Response {
-        buildClient()
+        val http = buildClient()
         val request = Request.Builder()
             .url("${getAPIUrl()}/fees")
             .build()
-        return client.newCall(request).await()
+        return callOn(http, request)
     }
 
 
     suspend fun getWallet(pubKey: String): Response {
-        buildClient()
+        val http = buildClient()
         val request = Request.Builder()
             .url("${getAPIUrl()}/wallet?active=${pubKey}")
             .build()
-        return client.newCall(request).await()
+        return callOn(http, request)
     }
 
     /**
@@ -387,11 +481,11 @@ open class ApiService {
      * Dojo's first page is index 0.
      */
     suspend fun getTxs(pubKey: String, page: Int, count: Int): Response {
-        buildClient()
+        val http = buildClient()
         val request = Request.Builder()
             .url("${getAPIUrl()}${dojoTxsQuery(pubKey, page, count)}")
             .build()
-        return client.newCall(request).await()
+        return callOn(http, request)
     }
 
 
@@ -400,8 +494,8 @@ open class ApiService {
         // of the five exchange providers. Their 401s must never reach the
         // Dojo TokenAuthenticator: it would burn a real Dojo re-login and
         // retry the exchange URL with `at=<Dojo access token>` appended.
-        buildClient(excludeApiKey = excludeApiKey, excludeAuthenticator = true)
-        return client.newCall(request).await()
+        val http = buildClient(excludeApiKey = excludeApiKey, excludeAuthenticator = true)
+        return callOn(http, request)
     }
 
 
@@ -428,7 +522,7 @@ open class ApiService {
     }
 
     suspend fun broadcast(hex: String): String {
-        buildClient()
+        val http = buildClient()
         val formBody: RequestBody = FormBody.Builder()
             .add("tx", hex.trim())
             .build()
@@ -436,7 +530,7 @@ open class ApiService {
             .url("${getAPIUrl()}/pushtx/")
             .post(formBody)
             .build()
-        val response = client.newCall(request).await()
+        val response = callOn(http, request)
         val string = response.body?.string() ?: "{}"
         val json = JSONObject(string)
         return if (response.isSuccessful) {

@@ -5,7 +5,10 @@ import androidx.lifecycle.MutableLiveData
 import com.samourai.sentinel.data.PubKeyCollection
 import com.samourai.sentinel.data.db.PayloadReadException
 import com.samourai.sentinel.data.db.SentinelCollectionStore
+import com.samourai.sentinel.util.CollectionImportDecision
+import com.samourai.sentinel.util.applyCollectionImportPlan
 import com.samourai.sentinel.util.dataBaseScope
+import com.samourai.sentinel.util.planCollectionImport
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -79,6 +82,46 @@ class CollectionRepository {
             pubKeyCollections.add(pubKeyCollection)
         }
         this.sync()
+    }
+
+    /**
+     * Applies a non-clearing import as one write.
+     *
+     * The plan is taken from the collections held right now, under the
+     * same lock as the write. Exact key sets and a unique subset or
+     * superset merge on their own. Any other shared-key case stays
+     * unresolved unless [decisions] chooses it, and an unresolved
+     * collection fails the import before anything is written. The
+     * result is checked against the list it was planned from: an
+     * existing collection has to still be there, and its keys stay,
+     * with new keys only appended. The payload write is awaited. If
+     * the check or the write fails, the in-memory list is left as it
+     * was, so a later sync cannot persist a partial import.
+     */
+    internal suspend fun applyCollectionImport(
+        incoming: List<PubKeyCollection>,
+        decisions: Map<Int, CollectionImportDecision> = emptyMap(),
+    ) {
+        withContext(Dispatchers.IO) {
+            writeMutex.withLock {
+                synchronized(pubKeyCollections) {
+                    if (!isPayloadUsable) {
+                        throw IllegalStateException(
+                            "Collections payload is not in a known-good state"
+                        )
+                    }
+                    val before = pubKeyCollections.map { collection ->
+                        collection.copy(pubs = ArrayList(collection.pubs.map { it.copy() }))
+                    }
+                    val plan = planCollectionImport(before, incoming, decisions)
+                    val next = applyCollectionImportPlan(before, plan)
+                    sentinelCollectionStore.getCollectionStore().write(next)
+                    pubKeyCollections.clear()
+                    pubKeyCollections.addAll(next)
+                }
+            }
+        }
+        this.emit()
     }
 
     fun delete(index: Int) {

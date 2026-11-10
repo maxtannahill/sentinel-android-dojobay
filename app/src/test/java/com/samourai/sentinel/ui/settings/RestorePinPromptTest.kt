@@ -251,7 +251,7 @@ class RestorePinPromptTest {
                 ImportBackUpActivity.REQUEST_KEY_RESTORE_PIN_CONFIRM,
                 Bundle().apply { putString(LockScreenDialog.RESULT_PIN, PIN) },
             )
-            awaitPinConfigured()
+            awaitPinEnabled()
         } finally {
             Timber.uproot(tree)
         }
@@ -561,20 +561,28 @@ class RestorePinPromptTest {
         activity?.supportFragmentManager?.executePendingTransactions()
     }
 
-    private fun awaitPinConfigured() {
-        // The wrap is committed before pinEnabled, and isPinConfigured()
-        // only reads the wrap. The save then posts back to the main
-        // looper. The pad accessibility sync posts there too, so a poll
-        // can land in that gap: the wrap is already visible, pinEnabled
-        // is still false, and the main hop is still queued.
+    /**
+     * #504: the confirm save runs on Dispatchers.IO and PinVault.enable
+     * commits twice on that worker - the key material first, the
+     * pinEnabled flag second. isPinConfigured() tracks the first
+     * commit, so polling it could exit inside the gap and leave the
+     * caller's pinEnabled assert to race the second commit. Await the
+     * enabled flag itself: both commits are synchronous on one worker,
+     * so pinEnabled implies the material landed too.
+     *
+     * #420: the save then hops back to the main looper, and the pad
+     * accessibility sync posts there as well, so drain the looper once
+     * pinEnabled is set before the caller inspects the screen.
+     */
+    private fun awaitPinEnabled() {
         val deadline = System.currentTimeMillis() + 90_000
         while (prefs.pinEnabled != true && System.currentTimeMillis() < deadline) {
             shadowOf(Looper.getMainLooper()).idle()
             Thread.sleep(50)
         }
         idle()
+        assertTrue("PIN was not enabled from the confirm pad", prefs.pinEnabled == true)
         assertTrue("PIN was not saved from the confirm pad", prefs.isPinConfigured())
-        assertEquals(true, prefs.pinEnabled)
     }
 
     private fun clearAccess() {

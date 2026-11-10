@@ -46,6 +46,7 @@ import com.samourai.sentinel.ui.views.confirm
 import com.samourai.sentinel.ui.webview.ExplorerRepository
 import com.samourai.sentinel.util.CollectionsNotLoadedException
 import com.samourai.sentinel.util.ExportImportUtil
+import com.samourai.sentinel.util.ImportLimits
 import com.samourai.sentinel.util.UtxoMetaUtil
 import org.json.JSONObject
 import kotlinx.coroutines.CoroutineScope
@@ -59,7 +60,6 @@ import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.File
 import java.io.IOException
-import java.io.InputStreamReader
 import java.io.OutputStream
 import java.io.OutputStreamWriter
 import java.io.PrintWriter
@@ -801,7 +801,8 @@ class MainSettingsFragment : PreferenceFragmentCompat() {
             try {
                 val result: ImportResult = withContext(Dispatchers.IO) {
                     requireContext().contentResolver.openInputStream(uri)!!.use { input ->
-                        bip329Importer.import(BufferedReader(InputStreamReader(input)))
+                        val text = ImportLimits.readBoundedText(input, ImportLimits.LABELS_MAX_BYTES)
+                        bip329Importer.import(BufferedReader(StringReader(text)))
                     }
                 }
                 MaterialAlertDialogBuilder(requireContext())
@@ -816,7 +817,7 @@ class MainSettingsFragment : PreferenceFragmentCompat() {
             } catch (ex: Exception) {
                 (activity as AppCompatActivity).showFloatingSnackBar(
                         parent_view = requireView(),
-                        text = "Label import failed : $ex"
+                        text = ImportLimits.labelImportFailureText(ex)
                 )
             }
         }
@@ -832,6 +833,7 @@ class MainSettingsFragment : PreferenceFragmentCompat() {
         settingsScope.launch {
             try {
                 val result: ImportResult = withContext(Dispatchers.IO) {
+                    ImportLimits.requireTextWithin(decoded, ImportLimits.LABELS_MAX_BYTES)
                     bip329Importer.import(BufferedReader(StringReader(decoded)))
                 }
                 MaterialAlertDialogBuilder(requireContext())
@@ -846,7 +848,7 @@ class MainSettingsFragment : PreferenceFragmentCompat() {
             } catch (ex: Exception) {
                 (activity as AppCompatActivity).showFloatingSnackBar(
                         parent_view = requireView(),
-                        text = "Label import failed : " + ex
+                        text = ImportLimits.labelImportFailureText(ex)
                 )
             }
         }

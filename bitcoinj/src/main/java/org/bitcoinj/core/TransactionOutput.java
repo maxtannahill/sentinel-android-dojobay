@@ -161,7 +161,7 @@ public class TransactionOutput extends ChildMessage {
     @Override
     protected void parse() throws ProtocolException {
         value = readInt64();
-        scriptLen = (int) readVarInt();
+        scriptLen = readLength();
         length = cursor - offset + scriptLen;
         scriptBytes = readBytes(scriptLen);
     }

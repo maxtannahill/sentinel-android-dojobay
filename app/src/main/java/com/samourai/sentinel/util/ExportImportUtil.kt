@@ -210,13 +210,25 @@ class ExportImportUtil {
                 utxoDao.delete()
                 txDao.delete()
                 collectionRepository.reset()
+                pubKeyCollection.forEach { collectionRepository.addNew(it) }
+                // #48: addNew's sync() writes are fire-and-forget; without an
+                // awaited final write, a restart-triggered read() could observe
+                // a partial list. syncNow() drains the queued writes and lands
+                // the complete list before the import reports success.
+                collectionRepository.syncNow()
+            } else {
+                // addNew() always assigns a new id, so appending every
+                // collection listed each one a second time. Merge against
+                // the collections already on the device instead, as one
+                // write. This screen has no collection picker: an exact
+                // key set, or the only subset/superset pair under that
+                // label, merges on its own. A partial overlap is kept
+                // as its own collection rather than folded in.
+                val decisions = pubKeyCollection.indices.associateWith {
+                    CollectionImportDecision.KeepSeparate
+                }
+                collectionRepository.applyCollectionImport(pubKeyCollection, decisions)
             }
-            pubKeyCollection.forEach { collectionRepository.addNew(it) }
-            // #48: addNew's sync() writes are fire-and-forget; without an
-            // awaited final write, a restart-triggered read() could observe
-            // a partial list. syncNow() drains the queued writes and lands
-            // the complete list before the import reports success.
-            collectionRepository.syncNow()
         } catch (ex: Exception) {
             throw ex
         }

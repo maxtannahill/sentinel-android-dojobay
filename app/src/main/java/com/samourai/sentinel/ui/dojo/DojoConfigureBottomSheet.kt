@@ -44,6 +44,7 @@ import com.samourai.sentinel.ui.utils.PrefsUtil
 import com.samourai.sentinel.ui.utils.permissionResultOf
 import com.samourai.sentinel.ui.utils.shouldAdmitScan
 import com.samourai.sentinel.ui.views.GenericBottomSheet
+import com.samourai.sentinel.util.ImportLimits
 import com.samourai.sentinel.util.OkHttpLogRedaction
 import com.samourai.sentinel.util.apiScope
 import kotlinx.coroutines.Dispatchers
@@ -462,7 +463,10 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
     fun onManualPasteClicked() {
         val jsonDojo = AndroidUtil.getClipBoardString(requireContext())
 
-        if (jsonDojo != null && dojoUtil.validate(jsonDojo!!)) {
+        if (jsonDojo != null &&
+            !ImportLimits.exceedsSensitivePaste(jsonDojo) &&
+            dojoUtil.validate(jsonDojo)
+        ) {
             payload = jsonDojo
             binding.pager.setCurrentItem(2, true)
         } else
@@ -484,7 +488,7 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
      * camera.
      */
     fun onScanPayload(scanned: String): Boolean {
-        if (dojoUtil.validate(scanned)) {
+        if (!ImportLimits.exceedsSensitivePaste(scanned) && dojoUtil.validate(scanned)) {
             payload = scanned
             binding.pager.setCurrentItem(2, true)
             return true
