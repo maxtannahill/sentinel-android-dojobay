@@ -130,4 +130,95 @@ class TorLogMaskingTest {
         assertTrue(src.contains("Timber.tag(TOR_LOG_TAG).w(TorLogMasking.mask(line))"))
         assertFalse("no unmasked Tor line", Regex("""Timber\.tag\(TOR_LOG_TAG\)\.\w\(line\)""").containsMatchIn(src))
     }
+
+    // #588 D1: the guard nickname in the path-bias warning.
+
+    @Test
+    fun `path-bias warning loses the guard nickname as well as the fingerprint`() {
+        val tail = " is failing a very large amount of circuits. Most likely this means the Tor network is " +
+            "overloaded, but it could also mean an attack against you or potentially the guard itself. " +
+            "Success counts are 52/181. Use counts are 23/23. 167 circuits completed, 0 were unusable, " +
+            "115 collapsed, and 15 timed out. For reference, your timeout cutoff is 60 seconds."
+        val out = TorLogMasking.mask("Your Guard SomeGuardRelay (\$$fp)$tail")
+        assertGone(out, fp, "SomeGuardRelay")
+        assertEquals("Your Guard NICKNAME_REDACTED (FINGERPRINT_REDACTED)$tail", out)
+
+        val usual = TorLogMasking.mask("Your Guard relay42 ($fp) is failing more circuits than usual. Success counts are 120/151.")
+        assertEquals("Your Guard NICKNAME_REDACTED (FINGERPRINT_REDACTED) is failing more circuits than usual. Success counts are 120/151.", usual)
+
+        val bare = TorLogMasking.mask("Guard MyGuard \$$fp is unusable")
+        assertEquals("Guard NICKNAME_REDACTED FINGERPRINT_REDACTED is unusable", bare)
+    }
+
+    @Test
+    fun `Tor's own words before a fingerprint stay`() {
+        val out = TorLogMasking.mask("Problem bootstrapping. Stuck at 14% (handshake): Handshaking with a relay. " +
+            "(DONE; DONE; count 1; recommendation warn; host $fp at 192.0.2.34:9101)")
+        assertTrue(out.endsWith("host FINGERPRINT_REDACTED at IP_REDACTED)"))
+    }
+
+    // #588 D2: long lines are cut, and the patterns stay fast on a small stack.
+
+    @Test
+    fun `a line past the cap is cut with a marker and a secret after the cap is dropped`() {
+        val head = "Bootstrapped 70% (loading_descriptors): Loading relay descriptors "
+        val line = head + "word ".repeat(500) + "host $fp at 192.0.2.34:9101 /data/user/0/x/app_tor/state"
+        assertTrue(line.length > TorLogMasking.MAX_LINE)
+        val out = TorLogMasking.mask(line)
+        assertGone(out, fp, "192.0.2.34", "9101", "/data/user")
+        assertTrue(out.startsWith(head))
+        assertTrue(out.endsWith(TorLogMasking.TRUNCATED))
+        assertTrue(out.length <= TorLogMasking.MAX_LINE + TorLogMasking.TRUNCATED.length)
+
+        // A fingerprint straddling the cap is dropped whole, not left as a fragment.
+        val pad = "x ".repeat((TorLogMasking.MAX_LINE - 10) / 2)
+        val straddle = TorLogMasking.mask(pad + "host $fp at 192.0.2.34:9101")
+        assertGone(straddle, fp.take(8), "192.0.2.34")
+        assertTrue(straddle.endsWith(TorLogMasking.TRUNCATED))
+
+        val short = "Bootstrapped 100% (done): Done"
+        assertEquals(short, TorLogMasking.mask(short))
+    }
+
+    @Test
+    fun `100k-character lines finish fast without overflowing a 256 KiB stack`() {
+        val inputs = listOf(
+            "1:".repeat(50_000),
+            "[" + "1:".repeat(50_000),
+            "[1:".repeat(33_000),
+            "::" + "ab:".repeat(33_000),
+            "a".repeat(100_000),
+            "host " + "0123456789abcdef:".repeat(6_000) + " at [" + ":".repeat(100_000),
+        )
+        var failure: Throwable? = null
+        val started = System.nanoTime()
+        val worker = Thread(null, {
+            try {
+                for (input in inputs) {
+                    TorLogMasking.maskRelayDetails(input)
+                    TorLogMasking.mask(input)
+                }
+            } catch (t: Throwable) {
+                failure = t
+            }
+        }, "tor-mask-small-stack", 256L * 1024)
+        worker.start()
+        worker.join(30_000)
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+        assertFalse("still running after $elapsedMs ms", worker.isAlive)
+        failure?.let { throw AssertionError("masking threw on a long line", it) }
+        assertTrue("took $elapsedMs ms", elapsedMs < 5_000)
+    }
+
+    @Test
+    fun `linear IPv6 patterns still mask real addresses and keep clock times`() {
+        assertEquals("on IP_REDACTED", TorLogMasking.maskRelayDetails("on 2001:db8:85a3:0:0:8a2e:370:7334"))
+        assertEquals("on IP_REDACTED.", TorLogMasking.maskRelayDetails("on fe80::1."))
+        assertEquals("on IP_REDACTED", TorLogMasking.maskRelayDetails("on ::1"))
+        assertEquals("at IP_REDACTED)", TorLogMasking.maskRelayDetails("at [2001:db8::1]:9001)"))
+        assertEquals("at IP_REDACTED", TorLogMasking.maskRelayDetails("at [::1]"))
+        for (kept in listOf("at 12:34:56.", "cafe: open", "Foo::bar", "a:b:c:d", "[scrubbed]:443")) {
+            assertEquals(kept, TorLogMasking.maskRelayDetails(kept))
+        }
+    }
 }
