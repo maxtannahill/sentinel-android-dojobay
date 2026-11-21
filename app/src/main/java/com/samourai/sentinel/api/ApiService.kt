@@ -336,12 +336,62 @@ open class ApiService {
     }
 
 
+
+    /**
+     * Sends [request] and, if the Dojo rejects it as an expired access
+     * token, refreshes the login once and resends.
+     *
+     * Dojo's authorizations manager maps a failed JWT verification
+     * (including expiry) to errors.auth.INVALID_JWT, "Invalid JSON Web
+     * Token". The HTTP server turns every errors.auth message into HTTP
+     * 401 with `{"status":"error","error":"Invalid JSON Web Token"}`
+     * (samourai-dojo: lib/auth/authorizations-manager.ts
+     * isAuthenticated / _verifyAccessToken; lib/http-server/http-server.ts
+     * onError; lib/errors.ts).
+     *
+     * A failed refresh returns the original response so the caller can
+     * surface that error. Timeouts and other failures are not retried.
+     *
+     * These calls keep [excludeAuthenticator]: TokenAuthenticator would
+     * also retry a 401, and stacking both would re-POST twice. The
+     * authenticator stays off login, refresh and third-party [request]
+     * for the reasons in #470 and #468.
+     */
+    private suspend fun callOnRetryingExpiredJwt(
+        captured: OkHttpClient,
+        request: Request,
+        maxBodyBytes: Int? = null,
+    ): Response {
+        val first = callOn(captured, request, maxBodyBytes)
+        if (!isExpiredDojoJwt(first)) return first
+        val refreshed = try {
+            refreshDojoAuth()
+        } catch (e: Exception) {
+            Timber.w("Dojo login refresh failed (%s)", e.javaClass.simpleName)
+            false
+        }
+        if (!refreshed) return first
+        first.close()
+        return callOn(captured, request, maxBodyBytes)
+    }
+
+    /** HTTP 401 whose body is Dojo's INVALID_JWT error. */
+    internal fun isExpiredDojoJwt(response: Response): Boolean {
+        if (response.code != 401) return false
+        val body = try {
+            response.peekBody(SafeJson.SMALL_BODY_MAX_BYTES.toLong()).string()
+        } catch (_: Exception) {
+            return false
+        }
+        return body.contains(DOJO_INVALID_JWT)
+    }
+
     suspend fun checkImportStatus(pubKey: String) = withContext(Dispatchers.IO) {
         val http = buildClient(excludeAuthenticator = true)
         val request = Request.Builder()
             .url("${getAPIUrl()}/xpub/${pubKey}/import/status")
             .build()
-        val response = callOn(http, request, maxBodyBytes = SafeJson.SMALL_BODY_MAX_BYTES)
+        val response = callOnRetryingExpiredJwt(http, request, maxBodyBytes = SafeJson.SMALL_BODY_MAX_BYTES)
         val status = response.body?.string()
         if (!status.isNullOrEmpty()) {
             val json = SafeJson.parseObject(status)
@@ -386,7 +436,7 @@ open class ApiService {
             .post(formBody)
             .build()
 
-        return callOn(http, request, maxBodyBytes = SafeJson.SMALL_BODY_MAX_BYTES)
+        return callOnRetryingExpiredJwt(http, request, maxBodyBytes = SafeJson.SMALL_BODY_MAX_BYTES)
     }
 
     /**
@@ -432,7 +482,7 @@ open class ApiService {
                 .post(formBody)
                 .build()
 
-            callOn(rescanClient, request, maxBodyBytes = SafeJson.SMALL_BODY_MAX_BYTES)
+            callOnRetryingExpiredJwt(rescanClient, request, maxBodyBytes = SafeJson.SMALL_BODY_MAX_BYTES)
         }
 
     /**
@@ -484,7 +534,7 @@ open class ApiService {
             .post(formBody)
             .build()
 
-        return callOn(http, request)
+        return callOnRetryingExpiredJwt(http, request)
     }
 
 
@@ -515,7 +565,7 @@ open class ApiService {
             .get()
             .url("${getAPIUrl()}/tx/$utxoHash/HEX")
             .build()
-        return callOn(http, request, maxBodyBytes = ImportLimits.PREV_TX_RESPONSE_MAX_BYTES)
+        return callOnRetryingExpiredJwt(http, request, maxBodyBytes = ImportLimits.PREV_TX_RESPONSE_MAX_BYTES)
     }
 
 
@@ -677,6 +727,9 @@ open class ApiService {
         private const val DOJO_STATUS_PEEK_BYTES = 80L
 
         /** Tor SOCKS handshake. A dead onion fails here, once. */
+        /** Dojo errors.auth.INVALID_JWT (lib/errors.ts). */
+        internal const val DOJO_INVALID_JWT = "Invalid JSON Web Token"
+
         internal const val TOR_CONNECT_SECONDS = 45L
 
         /** After the circuit exists, a slow Dojo may still be writing. */
