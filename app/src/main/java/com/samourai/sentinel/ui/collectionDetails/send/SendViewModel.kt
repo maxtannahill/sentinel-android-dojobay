@@ -244,6 +244,15 @@ class SendViewModel : ViewModel() {
         return true
     }
 
+    /**
+     * #612: whether "Use automatic selection" has anything to do. With no
+     * coins pinned, selection is already automatic and [clearPinnedSelection]
+     * changes nothing, so the picker disables the button instead of showing
+     * a tap that looks like it might help.
+     */
+    val canClearPinnedSelection: Boolean
+        get() = !_pinnedOutpoints.value.isNullOrEmpty()
+
     /** #190: back to automatic selection. */
     fun clearPinnedSelection() {
         if (_pinnedOutpoints.value.isNullOrEmpty()) return

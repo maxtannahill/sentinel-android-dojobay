@@ -62,6 +62,7 @@ class CoinPickerBottomSheet : GenericBottomSheet() {
     private lateinit var coSpendWarning: TextView
     private lateinit var empty: TextView
     private lateinit var confirmBtn: MaterialButton
+    private lateinit var autoBtn: MaterialButton
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -115,7 +116,8 @@ class CoinPickerBottomSheet : GenericBottomSheet() {
                 toast(R.string.coin_picker_selection_refused)
             }
         }
-        view.findViewById<MaterialButton>(R.id.coinPickerAutoBtn).setOnClickListener {
+        autoBtn = view.findViewById(R.id.coinPickerAutoBtn)
+        autoBtn.setOnClickListener {
             viewModel.clearPinnedSelection()
             dismiss()
         }
@@ -170,6 +172,13 @@ class CoinPickerBottomSheet : GenericBottomSheet() {
         confirmBtn.text = getString(R.string.coin_picker_confirm, chosen.size)
         confirmBtn.isEnabled = chosen.isNotEmpty()
         confirmBtn.alpha = if (chosen.isNotEmpty()) 1f else 0.6f
+        // #612: with nothing pinned, selection is already automatic. The
+        // button did nothing then, but tapping it sometimes seemed to fix a
+        // stuck compose (time in the sheet let a sync recompose). Retry on
+        // the send screen is the way to compose again now.
+        val canClear = viewModel.canClearPinnedSelection
+        autoBtn.isEnabled = canClear
+        autoBtn.alpha = if (canClear) 1f else 0.6f
         adapter.notifyDataSetChanged()
     }
 

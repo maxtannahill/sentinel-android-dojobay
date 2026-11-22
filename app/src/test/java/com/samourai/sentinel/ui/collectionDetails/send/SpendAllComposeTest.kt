@@ -411,6 +411,19 @@ class SpendAllComposeTest {
         assertEquals(null, composer.getComposedAmountSats())
     }
 
+    @Test
+    fun useAutomaticSelectionOnlyHasSomethingToDoWhileCoinsArePinned() {
+        val coins = listOf(wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1))
+        val vm = viewModel(coins)
+        assertTrue("already automatic", !vm.canClearPinnedSelection)
+        assertTrue(vm.setPinnedSelection(setOf(CoinSelection.keyOf(coins[0].utxo))))
+        vm.settle()
+        assertTrue(vm.canClearPinnedSelection)
+        vm.clearPinnedSelection()
+        vm.settle()
+        assertTrue(!vm.canClearPinnedSelection)
+    }
+
     // Fixture
 
     private fun composer() = TransactionComposer().apply { setPubKey(listOf(wallet.pub)) }
