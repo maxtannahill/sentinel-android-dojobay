@@ -115,6 +115,12 @@ class TransactionComposer {
 
     fun getComposedAmountSats(): Long? = composedAmountSats
 
+    /** #612: the miner fee of the last compose that succeeded, in sats. */
+    @Volatile
+    private var composedFeeSats: Long? = null
+
+    fun getComposedFeeSats(): Long? = composedFeeSats
+
     fun setPubKey(selectPubKeyModel: List<PubKeyModel>) {
         this.selectPubKeyModel = selectPubKeyModel
     }
@@ -157,6 +163,7 @@ class TransactionComposer {
             selectedUtxos = arrayListOf()
             balance = 0L
             composedAmountSats = null
+            composedFeeSats = null
             amount = inputAmountSats
             address = inputAddress
             selectedFee = inputFee
@@ -321,7 +328,6 @@ class TransactionComposer {
                     amount + fee.toLong()
                 )
             }
-            minerFeeChannel.send(fee.toLong())
             //
             //                    Log.d("SendActivity", "change:" + change);
 
@@ -544,6 +550,12 @@ class TransactionComposer {
             }
 
             composedAmountSats = amount
+            composedFeeSats = fee.toLong()
+            // #612: the fee is announced only once the PSBT exists. It used
+            // to go out before the prev-tx fetches, so Total miner fee could
+            // show next to a button that was still waiting on the Dojo, or
+            // that the compose then failed.
+            minerFeeChannel.send(fee.toLong())
             return true
         }
     }

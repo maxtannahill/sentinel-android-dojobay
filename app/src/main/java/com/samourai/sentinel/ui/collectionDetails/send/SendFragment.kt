@@ -635,8 +635,22 @@ class SendFragment : Fragment() {
      * #612: a Dojo or prev-tx failure is not the amount's fault, so it is
      * shown above COMPOSE with Retry instead of under BTC. It used to read
      * "Cannot build a transaction from these inputs" with no way to retry.
+     *
+     * While a compose runs, the same row shows a spinner and
+     * [R.string.send_composing]. It waits [COMPOSING_SHOW_DELAY_MS] first,
+     * so a compose served from the prev-tx cache does not flash it.
      */
     private fun showComposeStatus(blocker: SendViewModel.SpendBlocker) {
+        val binding = fragmentSpendBinding
+        binding.composeStatusRow.removeCallbacks(showComposing)
+        if (blocker == SendViewModel.SpendBlocker.COMPOSING) {
+            if (binding.composeStatusRow.visibility != View.VISIBLE) {
+                binding.composeStatusRow.postDelayed(showComposing, COMPOSING_SHOW_DELAY_MS)
+            } else {
+                showComposing.run()
+            }
+            return
+        }
         val status = when (blocker) {
             SendViewModel.SpendBlocker.DOJO_UNREACHABLE ->
                 getString(R.string.send_error_dojo_unreachable)
@@ -644,11 +658,21 @@ class SendFragment : Fragment() {
                 getString(R.string.send_error_prev_tx_unverified)
             else -> null
         }
-        fragmentSpendBinding.composeStatusText.text = status.orEmpty()
-        fragmentSpendBinding.composeRetryBtn.visibility =
+        binding.composeProgress.visibility = View.GONE
+        binding.composeStatusText.text = status.orEmpty()
+        binding.composeRetryBtn.visibility =
             if (blocker.canRetry) View.VISIBLE else View.GONE
-        fragmentSpendBinding.composeStatusRow.visibility =
+        binding.composeStatusRow.visibility =
             if (status != null) View.VISIBLE else View.GONE
+    }
+
+    private val showComposing = Runnable {
+        val binding = _fragmentSpendBinding ?: return@Runnable
+        if (viewModel.spendBlocker.value != SendViewModel.SpendBlocker.COMPOSING) return@Runnable
+        binding.composeProgress.visibility = View.VISIBLE
+        binding.composeStatusText.text = getString(R.string.send_composing)
+        binding.composeRetryBtn.visibility = View.GONE
+        binding.composeStatusRow.visibility = View.VISIBLE
     }
 
     /**
@@ -938,7 +962,8 @@ class SendFragment : Fragment() {
 
             view?.isEnabled = true
             view?.alpha = 1f
-            fragmentSpendBinding.composeBtn.isEnabled = true
+            // #612: COMPOSE follows validSpend. Enabling it here undid the
+            // disabled state of the compose this account change started.
             }
     }
 
@@ -1004,7 +1029,7 @@ class SendFragment : Fragment() {
 
                 view?.isEnabled = true
                 view?.alpha = 1f
-                fragmentSpendBinding.composeBtn.isEnabled = true
+                // #612: COMPOSE follows validSpend (see setDropDownPub).
             }
             if (items.size == 0) {
                 return
@@ -1224,5 +1249,7 @@ class SendFragment : Fragment() {
         private const val REQ_CODE_SAVE_TXT = 2
         // The fee slider's scale: slider value = (sat/vB - 1) * this.
         private const val FEE_SLIDER_MULTIPLIER = 10000
+        // #612: a compose shorter than this does not show the progress row.
+        private const val COMPOSING_SHOW_DELAY_MS = 300L
     }
 }

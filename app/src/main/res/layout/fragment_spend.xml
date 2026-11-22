@@ -140,7 +140,7 @@
             android:orientation="vertical"
             android:background="@color/grey_homeActivity">
 
-            <!-- #612: why COMPOSE is waiting on the Dojo, with Retry. -->
+            <!-- #612: COMPOSE is working, or why it is waiting on the Dojo, with Retry. -->
             <LinearLayout
                 android:id="@+id/composeStatusRow"
                 android:layout_width="match_parent"
@@ -151,6 +151,15 @@
                 android:gravity="center_vertical"
                 android:orientation="horizontal"
                 android:visibility="gone">
+
+                <ProgressBar
+                    android:id="@+id/composeProgress"
+                    style="?android:attr/progressBarStyleSmall"
+                    android:layout_width="16dp"
+                    android:layout_height="16dp"
+                    android:layout_marginEnd="8dp"
+                    android:indeterminate="true"
+                    android:visibility="gone" />
 
                 <TextView
                     android:id="@+id/composeStatusText"

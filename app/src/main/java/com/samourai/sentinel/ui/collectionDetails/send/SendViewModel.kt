@@ -138,7 +138,14 @@ class SendViewModel : ViewModel() {
          * previous transactions (a login the refresh could not renew, a
          * server error). The screen offers Retry.
          */
-        DOJO_UNREACHABLE;
+        DOJO_UNREACHABLE,
+        /**
+         * #612: a compose is running. Set when the job starts, so a stale
+         * reason from the last compose is cleared and the screen can say
+         * it is still working (the prev-tx fetches take a few seconds per
+         * coin over Tor).
+         */
+        COMPOSING;
 
         /** #612: a failure that trying again can fix, so the screen offers Retry. */
         val canRetry: Boolean get() = this == PREV_TX_UNVERIFIED || this == DOJO_UNREACHABLE
@@ -249,16 +256,17 @@ class SendViewModel : ViewModel() {
 
 
     init {
-        //Listen for the miner fee change from TransactionComposer
+        // #612: the composer still announces each fee on this channel. The
+        // figure is published with the compose verdict instead (see
+        // prepareSpend), so a compose that a newer one replaced cannot
+        // paint its fee. Draining keeps the composer from waiting here.
         viewModelScope.launch {
-            for (value in transactionComposer.getMinerFee()) {
-                withContext(Dispatchers.Main) {
-                    val formattedFee = MonetaryUtil.getInstance().getBTCDecimalFormat(value)
-                    _minerFee.postValue("$formattedFee BTC")
-                }
-            }
+            for (ignored in transactionComposer.getMinerFee()) Unit
         }
     }
+
+    private fun formatFee(sats: Long): String =
+        MonetaryUtil.getInstance().getBTCDecimalFormat(sats) + " BTC"
 
     fun setPublicKey(
         pubKeyModel: PubKeyModel,
@@ -391,6 +399,9 @@ class SendViewModel : ViewModel() {
         // #190: the PSBT held by the composer belongs to the previous input
         // set until this compose finishes; makeTx must not hand it out.
         _validSpend.value = false
+        // #612: say it is working, clear the last reason, and hide the fee
+        // until this compose has one.
+        block(SpendBlocker.COMPOSING)
         job = viewModelScope.launch(Dispatchers.Default) {
             try {
                 receivers = HashMap()
@@ -408,9 +419,11 @@ class SendViewModel : ViewModel() {
                         spendAll = spendAll
                     )
                     val sent = transactionComposer.getComposedAmountSats()
+                    val fee = transactionComposer.getComposedFeeSats()
                     withContext(Dispatchers.Main) {
                         if (generation != spendGeneration) return@withContext
                         _spendAllSentSats.value = if (isValid && spendAll) sent else null
+                        _minerFee.postValue(if (isValid && fee != null) formatFee(fee) else "")
                         _validSpend.postValue(isValid)
                         _spendBlocker.postValue(
                             if (isValid) SpendBlocker.NONE else SpendBlocker.CANNOT_COMPOSE

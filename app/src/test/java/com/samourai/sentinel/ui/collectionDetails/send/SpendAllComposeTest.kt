@@ -362,6 +362,55 @@ class SpendAllComposeTest {
         assertTrue(!SendViewModel.SpendBlocker.CANNOT_COMPOSE.canRetry)
     }
 
+    @Test
+    fun composeSaysItIsWorkingAndShowsTheFeeOnlyOnceItSucceeds() {
+        val coins = listOf(wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1))
+        val vm = viewModel(coins)
+        mode = Mode.SLOW
+        vm.setSpendAll(19_506_493L)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(SendViewModel.SpendBlocker.COMPOSING, vm.spendBlocker.value)
+        assertEquals(false, vm.validSpend.value)
+        assertEquals("no fee while the Dojo is still being asked", "", vm.minerFee.value)
+        vm.settle()
+        assertEquals(SendViewModel.SpendBlocker.NONE, vm.spendBlocker.value)
+        assertTrue(vm.minerFee.value!!.endsWith(" BTC"))
+
+        // A compose that then fails on the Dojo leaves no fee behind.
+        val fresh = viewModel(coins)
+        mode = Mode.UNAVAILABLE
+        fresh.setSpendAll(19_506_493L)
+        fresh.settle()
+        assertEquals(SendViewModel.SpendBlocker.DOJO_UNREACHABLE, fresh.spendBlocker.value)
+        assertEquals("", fresh.minerFee.value)
+    }
+
+    @Test
+    fun theComposerAnnouncesNoFeeForAComposeThatFailsOnThePrevTx() {
+        val coins = listOf(wallet.funded(12_000_000L, 0))
+        mode = Mode.UNAVAILABLE
+        val composer = composer()
+        runBlocking {
+            withTimeout(20_000) {
+                val fee = async { composer.getMinerFee().receive() }
+                try {
+                    composer.compose(
+                        inputUtxos = ArrayList(coins.map { it.utxo }),
+                        inputAddress = wallet.externalAddress,
+                        inputFee = 1000L,
+                        inputAmountSats = 5_000_000L,
+                    )
+                    fail("expected compose to fail")
+                } catch (expected: TransactionComposer.PrevTxException) {
+                }
+                assertTrue("the fee went out before the Dojo answered", !fee.isCompleted)
+                fee.cancel()
+            }
+        }
+        assertEquals(null, composer.getComposedFeeSats())
+        assertEquals(null, composer.getComposedAmountSats())
+    }
+
     // Fixture
 
     private fun composer() = TransactionComposer().apply { setPubKey(listOf(wallet.pub)) }
@@ -568,6 +617,8 @@ class SpendAllComposeTest {
         UNAVAILABLE,
         /** The connection drops before an answer. */
         DROP,
+        /** Serves, but each prev tx takes a while (a slow Tor circuit). */
+        SLOW,
     }
 
     companion object {
@@ -616,12 +667,17 @@ class SpendAllComposeTest {
                             return MockResponse().setResponseCode(503).setBody("""{"status":"error"}""")
                         Mode.DROP ->
                             return MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST)
+                        Mode.SLOW -> Unit
                     }
                     val txid = path.substringAfter("/tx/").substringBefore("/HEX")
                     val hex = served[txid]
                         ?: return MockResponse().setResponseCode(404)
                             .setBody("""{"status":"error"}""")
-                    return MockResponse().setBody("""{"status":"ok","data":"$hex"}""")
+                    val served = MockResponse().setBody("""{"status":"ok","data":"$hex"}""")
+                    if (mode == Mode.SLOW) {
+                        served.setHeadersDelay(400, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    }
+                    return served
                 }
             }
         }
