@@ -77,6 +77,48 @@
             android:visibility="gone" />
     </LinearLayout>
 
+    <!-- Shown when Tor Routing is off: do not start Tor until the user taps the button. -->
+    <LinearLayout
+        android:id="@+id/communityDojoTorOff"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginHorizontal="24dp"
+        android:layout_marginTop="32dp"
+        android:gravity="center_horizontal"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/communityDojoTorOffTitle"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:text="@string/community_dojo_tor_off_title"
+            android:textColor="@color/white"
+            android:textSize="16sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/communityDojoTorOffBody"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:text="@string/community_dojo_tor_off_body"
+            android:textColor="#CFCFCF"
+            android:textSize="14sp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/communityDojoEnableTor"
+            style="@style/Widget.MaterialComponents.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="@string/community_dojo_turn_on_tor"
+            android:textAllCaps="false"
+            android:textColor="@color/green_ui_2" />
+    </LinearLayout>
+
     <TextView
         android:id="@+id/communityDojoStatusText"
         android:layout_width="match_parent"

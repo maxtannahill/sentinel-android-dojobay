@@ -18,6 +18,7 @@ import com.samourai.sentinel.core.SentinelState
 import com.samourai.sentinel.data.repository.CollectionRepository
 import com.samourai.sentinel.tor.EnumTorState
 import com.samourai.sentinel.tor.SentinelTorManager
+import com.samourai.sentinel.tor.TorRouting
 import com.samourai.sentinel.tor.TorState
 import com.samourai.sentinel.ui.SentinelActivity
 import com.samourai.sentinel.ui.dojo.DojoBayAddressDialog
@@ -228,8 +229,7 @@ class NetworkActivity : SentinelActivity() {
                 else
                     this.showFloatingSnackBar(torButton!!.rootView, text = getString(R.string.tor_disable_dojo_blocked))
             } else {
-                SentinelTorManager.start()
-                prefsUtil.enableTor = true
+                TorRouting.enable(prefsUtil)
             }
 
         }

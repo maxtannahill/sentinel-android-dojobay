@@ -25,6 +25,7 @@ import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.button.MaterialButton
 import com.samourai.sentinel.R
 import com.samourai.sentinel.tor.SentinelTorManager
+import com.samourai.sentinel.tor.TorRouting
 import com.samourai.sentinel.ui.utils.PrefsUtil
 import com.samourai.sentinel.ui.views.GenericBottomSheet
 import kotlinx.coroutines.CancellationException
@@ -65,6 +66,8 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
     private lateinit var progressBar: ProgressBar
     private lateinit var statusText: TextView
     private lateinit var retryButton: MaterialButton
+    private lateinit var torOff: View
+    private lateinit var enableTorButton: MaterialButton
     private lateinit var changeAddressButton: MaterialButton
     private lateinit var banner: LinearLayout
     private lateinit var bannerText: TextView
@@ -179,6 +182,8 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
         progressBar = view.findViewById(R.id.communityDojoProgress)
         statusText = view.findViewById(R.id.communityDojoStatusText)
         retryButton = view.findViewById(R.id.communityDojoRetryButton)
+        torOff = view.findViewById(R.id.communityDojoTorOff)
+        enableTorButton = view.findViewById(R.id.communityDojoEnableTor)
         changeAddressButton = view.findViewById(R.id.communityDojoChangeAddressButton)
         banner = view.findViewById(R.id.communityDojoBanner)
         bannerText = view.findViewById(R.id.communityDojoBannerText)
@@ -197,6 +202,7 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
         recyclerView.adapter = adapter
         retryButton.setOnClickListener { connectTorThenFetch() }
         bannerRetry.setOnClickListener { connectTorThenFetch() }
+        enableTorButton.setOnClickListener { turnOnTorAndFetch() }
         changeAddressButton.setOnClickListener { showAddressDialog() }
 
         loadCacheThenFetch()
@@ -277,8 +283,53 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
         return java.text.SimpleDateFormat(pattern, locale).format(Date(ms))
     }
 
+    /**
+     * TURN ON TOR: enable Tor Routing the same way Settings does, then
+     * wait for Tor and fetch.
+     */
+    private fun turnOnTorAndFetch() {
+        if (!isAdded) return
+        // Same path as the Settings toggle: set the pref and start().
+        // setUp() is already done by the Application (and connectTorThenFetch
+        // will call it if a wait is still needed).
+        TorRouting.enable(prefsUtil)
+        connectTorThenFetch()
+    }
+
+    /** Status and button for when the user's Tor Routing setting is off. */
+    private fun showTorRoutingOff() {
+        if (!isAdded) return
+        stopElapsedTicker()
+        banner.visibility = View.GONE
+        progressBar.visibility = View.GONE
+        statusText.visibility = View.GONE
+        retryButton.visibility = View.GONE
+        changeAddressButton.visibility = View.VISIBLE
+        torOff.visibility = View.VISIBLE
+        val savedNodes = cachedForNetwork()
+        if (savedNodes.isNotEmpty()) {
+            recyclerView.visibility = View.VISIBLE
+            adapter.submitList(savedNodes)
+        } else {
+            recyclerView.visibility = View.GONE
+        }
+    }
+
+    private fun hideTorOff() {
+        if (::torOff.isInitialized) torOff.visibility = View.GONE
+    }
+
+    /**
+     * Retry and the banner Retry share this entry. If Tor Routing is off
+     * and Tor is not already on or starting, show the off state and do
+     * not start Tor or fetch.
+     */
     private fun connectTorThenFetch() {
         if (fetchInFlight) return
+        if (!TorRouting.directoryMayUseTor(prefsUtil)) {
+            showTorRoutingOff()
+            return
+        }
         torStillStarting = false
         directoryLoads++
         // State can say ON from a stale LiveData while the proxy object
@@ -644,6 +695,7 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
      * banner (it is still pairable); otherwise the spinner and status line.
      */
     private fun showLoading(message: String, waitingForTor: Boolean = false) {
+        hideTorOff()
         changeAddressButton.visibility = View.GONE
         retryButton.visibility = View.GONE
         val saved = cached
@@ -670,6 +722,7 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
     }
 
     private fun showMessage(message: String, canRetry: Boolean, canChangeAddress: Boolean = false) {
+        hideTorOff()
         stopElapsedTicker()
         banner.visibility = View.GONE
         progressBar.visibility = View.GONE
@@ -682,6 +735,7 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
 
     /** [bannerMessage] null: a fresh list, no banner. Otherwise the saved-list banner with Retry. */
     private fun showList(nodes: List<CheckedDojo>, bannerMessage: String?) {
+        hideTorOff()
         stopElapsedTicker()
         progressBar.visibility = View.GONE
         statusText.visibility = View.GONE
