@@ -1,0 +1,386 @@
+package com.samourai.sentinel.ui.collectionDetails.send
+
+import android.app.Application
+import android.os.Looper
+import androidx.test.core.app.ApplicationProvider
+import com.samourai.sentinel.api.ApiService
+import com.samourai.sentinel.core.SentinelState
+import com.samourai.sentinel.core.hd.HD_Account
+import com.samourai.sentinel.data.AddressTypes
+import com.samourai.sentinel.data.PubKeyModel
+import com.samourai.sentinel.data.Utxo
+import com.samourai.sentinel.data.db.SentinelCollectionStore
+import com.samourai.sentinel.data.repository.CollectionRepository
+import com.samourai.sentinel.send.FeeUtil
+import com.samourai.sentinel.send.SuggestedFee
+import com.samourai.sentinel.ui.dojo.DojoUtility
+import com.samourai.sentinel.ui.utils.PrefsUtil
+import com.samourai.wallet.segwit.SegwitAddress
+import com.samourai.wallet.segwit.bech32.Bech32UtilGeneric
+import com.samourai.wallet.util.XPUB
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
+import org.bitcoinj.core.Coin
+import org.bitcoinj.core.ECKey
+import org.bitcoinj.core.NetworkParameters
+import org.bitcoinj.core.Transaction
+import org.bitcoinj.core.TransactionInput
+import org.bitcoinj.core.TransactionOutput
+import org.bitcoinj.crypto.ChildNumber
+import org.bitcoinj.crypto.HDKeyDerivation
+import org.bouncycastle.util.encoders.Hex
+import org.junit.AfterClass
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Before
+import org.junit.BeforeClass
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.koin.android.ext.koin.androidContext
+import org.koin.core.context.GlobalContext
+import org.koin.core.context.startKoin
+import org.koin.core.context.stopKoin
+import org.koin.dsl.module
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
+import org.robolectric.annotation.Config
+import java.math.BigInteger
+import java.net.InetAddress
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * #612: tapping the available total on Send, against the real
+ * [TransactionComposer] and a fake Dojo that serves each funding tx by
+ * txid. Fixture and runtime bootstrap follow [ExplicitSelectionComposeTest].
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34], application = Application::class)
+class SpendAllComposeTest {
+
+    private lateinit var wallet: Wallet
+
+    @Before
+    fun setUp() {
+        ensureRuntime(serverUrl())
+        val suggested = SuggestedFee()
+        suggested.defaultPerKB = BigInteger.valueOf(1000L)
+        FeeUtil.getInstance().suggestedFee = suggested
+        wallet = Wallet(SentinelState.getNetworkParam()!!)
+        mode = Mode.SERVE
+        hexRequests.set(0)
+        authRequests.set(0)
+    }
+
+    @Test
+    fun theFigureThatComposedBeforeStillComposesAsAMaxSend() {
+        // 0.19506493 BTC over two coins: the round trip happens to land on
+        // the exact sats for this one, so it composed before as well.
+        val coins = listOf(wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1))
+        val tx = compose(coins, 19_506_493L)
+        assertEquals(2, tx.inputs.size)
+        assertEquals(1, tx.outputs.size)
+        assertEquals(2, hexRequests.get())
+    }
+
+    @Test
+    fun totalsTheDoubleRoundTripBrokeComposeAOneOutputMaxSend() {
+        // 29,000,000 and 8,000,028 sats came back one sat low through
+        // (sats / 1e8) * 1e8, missed the max-send branch and failed with
+        // "Change is dust 2". Whole sats reach the composer now.
+        val two = listOf(wallet.funded(20_000_000L, 0), wallet.funded(9_000_000L, 1))
+        val maxTwo = compose(two, 29_000_000L)
+        assertEquals(1, maxTwo.outputs.size)
+        assertEquals(29_000_000L - feeFor(maxTwo, two), maxTwo.outputs[0].value.value)
+
+        val eight = (0 until 8).map { wallet.funded(1_000_000L + it, 10 + it) }
+        val maxEight = compose(eight, 8_000_028L)
+        assertEquals(8, maxEight.inputs.size)
+        assertEquals(1, maxEight.outputs.size)
+    }
+
+    @Test
+    fun typing029BuildsAnOutputOfExactly29MillionSats() {
+        val coins = listOf(wallet.funded(50_000_000L, 0))
+        val typed = SatsAmount.parseBtc("0.29")!!
+        val tx = compose(coins, typed)
+        assertEquals(2, tx.outputs.size)
+        assertTrue(tx.outputs.any { it.value.value == 29_000_000L })
+    }
+
+    // Fixture
+
+    private fun composer() = TransactionComposer().apply { setPubKey(listOf(wallet.pub)) }
+
+    private fun compose(
+        utxos: List<FundedUtxo>,
+        amountSats: Long,
+        explicit: Boolean = false,
+        composer: TransactionComposer = composer(),
+    ): Transaction {
+        val bytes = runBlocking {
+            withTimeout(20_000) {
+                val fee = async { composer.getMinerFee().receive() }
+                val ok = composer.compose(
+                    inputUtxos = ArrayList(utxos.map { it.utxo }),
+                    inputAddress = wallet.externalAddress,
+                    inputFee = 1000L,
+                    inputAmountSats = amountSats,
+                    explicitSelection = explicit,
+                )
+                assertTrue(ok)
+                fee.await()
+                composer.getPSBT()?.toBytes() ?: error("composer returned no PSBT bytes")
+            }
+        }
+        return unsignedTx(bytes)
+    }
+
+    private fun composeFailure(
+        utxos: List<FundedUtxo>,
+        amountSats: Long,
+        composer: TransactionComposer = composer(),
+    ): Exception = runBlocking {
+        withTimeout(20_000) {
+            val fee = async { composer.getMinerFee().receive() }
+            try {
+                composer.compose(
+                    inputUtxos = ArrayList(utxos.map { it.utxo }),
+                    inputAddress = wallet.externalAddress,
+                    inputFee = 1000L,
+                    inputAmountSats = amountSats,
+                )
+                fail("expected compose to fail")
+                throw IllegalStateException()
+            } catch (e: Exception) {
+                if (e is AssertionError) throw e
+                e
+            } finally {
+                fee.cancel()
+            }
+        }
+    }
+
+    private fun feeFor(tx: Transaction, coins: List<FundedUtxo>): Long =
+        coins.sumOf { it.utxo.value!! } - tx.outputs.sumOf { it.value.value }
+
+    /** The PSBT global unsigned tx (key type 0x00, first global record). */
+    private fun unsignedTx(psbt: ByteArray): Transaction {
+        var i = 5 // magic + 0xff
+        fun compact(): Int {
+            val first = psbt[i++].toInt() and 0xff
+            return when (first) {
+                0xfd -> (psbt[i++].toInt() and 0xff) or ((psbt[i++].toInt() and 0xff) shl 8)
+                0xfe -> {
+                    var v = 0
+                    for (s in 0 until 4) v = v or ((psbt[i++].toInt() and 0xff) shl (8 * s))
+                    v
+                }
+                else -> first
+            }
+        }
+        while (true) {
+            val keyLen = compact()
+            check(keyLen != 0) { "no unsigned tx in PSBT globals" }
+            val keyType = psbt[i].toInt() and 0xff
+            i += keyLen
+            val valueLen = compact()
+            val value = psbt.copyOfRange(i, i + valueLen)
+            i += valueLen
+            if (keyType == 0x00) return Transaction(SentinelState.getNetworkParam(), value)
+        }
+    }
+
+    /** #469: the Utxo plus the funding-tx hex the fake Dojo serves. */
+    private class FundedUtxo(val utxo: Utxo, val hex: String)
+
+    private class Wallet(val params: NetworkParameters) {
+        val zpub: String
+        val externalAddress: String
+        val pub: PubKeyModel
+
+        init {
+            val seed = ByteArray(32) { (it + 7).toByte() }
+            val master = HDKeyDerivation.createMasterPrivateKey(seed)
+            val accountKey = HDKeyDerivation.deriveChildKey(
+                HDKeyDerivation.deriveChildKey(
+                    HDKeyDerivation.deriveChildKey(master, ChildNumber(84, true)),
+                    ChildNumber(0, true)
+                ),
+                ChildNumber(0, true)
+            )
+            zpub = XPUB.makeXPUB(
+                XPUB.MAGIC_ZPUB,
+                accountKey.depth.toByte(),
+                accountKey.parentFingerprint,
+                accountKey.childNumber.i(),
+                accountKey.chainCode,
+                accountKey.pubKey
+            )
+            externalAddress = SegwitAddress(
+                ECKey.fromPrivate(ByteArray(32) { 0x24 }).pubKey,
+                params
+            ).bech32AsString
+            pub = PubKeyModel(
+                pubKey = zpub,
+                label = "Deposit",
+                type = AddressTypes.BIP84,
+                change_index = 3,
+                fingerPrint = "0badf00d"
+            )
+        }
+
+        fun funded(value: Long, index: Int): FundedUtxo {
+            val account = HD_Account(params, zpub, "", 0)
+            val key = account.getChain(0).getAddressAt(index).ecKey
+            val address = SegwitAddress(key.pubKey, params).bech32AsString
+            val script = Bech32UtilGeneric.getInstance().computeScriptPubKey(address, params)
+            val funding = Transaction(params)
+            // One dummy OP_TRUE input keeps the serialization unambiguously
+            // legacy (no inputs + one output reads as a BIP144 marker).
+            funding.addInput(TransactionInput(params, funding, byteArrayOf(0x51)))
+            funding.addOutput(TransactionOutput(params, funding, Coin.valueOf(value), script))
+            val hex = Hex.toHexString(funding.bitcoinSerialize())
+            val txid = funding.hash.toString()
+            served[txid] = hex
+            return FundedUtxo(
+                Utxo(
+                    idx = txid,
+                    addr = address,
+                    confirmations = 1,
+                    script = Hex.toHexString(script),
+                    txHash = txid,
+                    txOutputN = 0,
+                    value = value,
+                    path = "m/0/$index",
+                    pubKey = zpub
+                ),
+                hex
+            )
+        }
+    }
+
+    /** How the fake Dojo answers /tx/{txid}/HEX. */
+    internal enum class Mode {
+        SERVE,
+        /** 401 Invalid JSON Web Token until the login has been refreshed once. */
+        EXPIRED_UNTIL_REFRESH,
+        /** 401 Invalid JSON Web Token, and the refresh is refused too. */
+        EXPIRED_REFRESH_REFUSED,
+        /** 503 from the Dojo. */
+        UNAVAILABLE,
+        /** The connection drops before an answer. */
+        DROP,
+    }
+
+    companion object {
+        @Volatile
+        private var startedKoin = false
+
+        private lateinit var server: MockWebServer
+        private lateinit var prefs: PrefsUtil
+
+        private val served = HashMap<String, String>()
+
+        @Volatile
+        internal var mode = Mode.SERVE
+        @Volatile
+        private var refreshed = false
+        val hexRequests = AtomicInteger()
+        val authRequests = AtomicInteger()
+
+        private const val DOJO_EXPIRED = """{"status":"error","error":"Invalid JSON Web Token"}"""
+        private const val FRESH_AUTH =
+            """{"authorizations":{"access_token":"access-new","refresh_token":"refresh-new"}}"""
+
+        private fun serverUrl(): String = server.url("/").toString()
+
+        private fun installDispatcher() {
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    val path = request.path.orEmpty()
+                    if (path.contains("/auth/")) {
+                        authRequests.incrementAndGet()
+                        if (mode == Mode.EXPIRED_REFRESH_REFUSED) {
+                            return MockResponse().setResponseCode(401).setBody(DOJO_EXPIRED)
+                        }
+                        refreshed = true
+                        return MockResponse().setBody(FRESH_AUTH)
+                    }
+                    hexRequests.incrementAndGet()
+                    when (mode) {
+                        Mode.SERVE -> Unit
+                        Mode.EXPIRED_UNTIL_REFRESH -> if (!refreshed) {
+                            return MockResponse().setResponseCode(401).setBody(DOJO_EXPIRED)
+                        }
+                        Mode.EXPIRED_REFRESH_REFUSED ->
+                            return MockResponse().setResponseCode(401).setBody(DOJO_EXPIRED)
+                        Mode.UNAVAILABLE ->
+                            return MockResponse().setResponseCode(503).setBody("""{"status":"error"}""")
+                        Mode.DROP ->
+                            return MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START)
+                    }
+                    val txid = path.substringAfter("/tx/").substringBefore("/HEX")
+                    val hex = served[txid]
+                        ?: return MockResponse().setResponseCode(404)
+                            .setBody("""{"status":"error"}""")
+                    return MockResponse().setBody("""{"status":"ok","data":"$hex"}""")
+                }
+            }
+        }
+
+        private fun ensureRuntime(baseUrl: String) {
+            GlobalContext.getOrNull()?.let { stopKoin() }
+            val app = ApplicationProvider.getApplicationContext<Application>()
+            prefs = PrefsUtil(app)
+            prefs.testnet = false
+            prefs.apiEndPoint = baseUrl
+            // Synthetic values: only the fake Dojo above ever sees them.
+            prefs.authorization = "access-old"
+            prefs.refreshToken = "refresh-old"
+            refreshed = false
+            startKoin {
+                androidContext(app)
+                modules(
+                    module {
+                        single { prefs }
+                        single { CollectionRepository() }
+                        single { ApiService() }
+                        // getAPIUrl() asks SentinelState.isTorRequired(),
+                        // which needs a DojoUtility. An empty Dojo store
+                        // keeps requests on the plain apiEndPoint with Tor off.
+                        single { SentinelCollectionStore() }
+                        single { DojoUtility() }
+                    }
+                )
+            }
+            startedKoin = true
+            check(!SentinelState.isTestNet()) { "fixture is a mainnet zpub" }
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+
+        @JvmStatic
+        @BeforeClass
+        fun setUpClass() {
+            server = MockWebServer()
+            server.start(InetAddress.getByName("127.0.0.1"), 0)
+            installDispatcher()
+        }
+
+        @JvmStatic
+        @AfterClass
+        fun tearDownClass() {
+            if (startedKoin) {
+                stopKoin()
+                startedKoin = false
+            }
+            server.shutdown()
+            served.clear()
+        }
+    }
+}

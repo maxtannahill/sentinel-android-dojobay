@@ -580,7 +580,7 @@ class PsbtFileExportTest {
                     inputUtxos = arrayListOf(funded.utxo),
                     inputAddress = wallet.externalAddress,
                     inputFee = 1000L,
-                    inputAmount = 50_000.0,
+                    inputAmountSats = 50_000L,
                     explicitSelection = true,
                 )
                 assertTrue(ok)

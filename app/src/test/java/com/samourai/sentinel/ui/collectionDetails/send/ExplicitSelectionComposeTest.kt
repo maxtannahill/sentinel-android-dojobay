@@ -147,7 +147,7 @@ class ExplicitSelectionComposeTest {
                         inputUtxos = arrayListOf(foreign),
                         inputAddress = wallet.externalAddress,
                         inputFee = 1000L,
-                        inputAmount = 50_000.0,
+                        inputAmountSats = 50_000L,
                         explicitSelection = true
                     )
                     fail("a pinned coin outside the account must not be dropped silently")
@@ -169,7 +169,7 @@ class ExplicitSelectionComposeTest {
                         inputUtxos = ArrayList(utxos.map { it.utxo }),
                         inputAddress = wallet.externalAddress,
                         inputFee = 1000L,
-                        inputAmount = amountSats.toDouble(),
+                        inputAmountSats = amountSats,
                         explicitSelection = true
                     )
                     fail("expected InsufficientSelectionException")
@@ -194,7 +194,7 @@ class ExplicitSelectionComposeTest {
                     inputUtxos = ArrayList(utxos.map { it.utxo }),
                     inputAddress = wallet.externalAddress,
                     inputFee = 1000L,
-                    inputAmount = amountSats.toDouble(),
+                    inputAmountSats = amountSats,
                     explicitSelection = explicit
                 )
                 assertTrue(ok)

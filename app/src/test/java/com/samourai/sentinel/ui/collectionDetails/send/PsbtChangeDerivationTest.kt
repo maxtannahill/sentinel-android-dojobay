@@ -203,7 +203,7 @@ class PsbtChangeDerivationTest {
                     inputUtxos = ArrayList(utxos.map { it.utxo }),
                     inputAddress = destination,
                     inputFee = 1000L,
-                    inputAmount = amountSats.toDouble()
+                    inputAmountSats = amountSats
                 )
                 assertTrue(ok)
                 fee.await()

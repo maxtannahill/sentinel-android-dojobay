@@ -168,7 +168,7 @@ class ComposeInputVerificationTest {
                     inputUtxos = ArrayList(funded.map { it.utxo }),
                     inputAddress = wallet.externalAddress,
                     inputFee = 1000L,
-                    inputAmount = 2_000_000.0
+                    inputAmountSats = 2_000_000L
                 )
                 assertTrue(ok)
                 fee.await()
@@ -193,7 +193,7 @@ class ComposeInputVerificationTest {
                         inputUtxos = ArrayList(utxos.toList()),
                         inputAddress = wallet.externalAddress,
                         inputFee = 1000L,
-                        inputAmount = 2_000_000.0
+                        inputAmountSats = 2_000_000L
                     )
                     fail("compose must fail closed on an unverified input")
                 } catch (e: TransactionComposer.ComposeException) {

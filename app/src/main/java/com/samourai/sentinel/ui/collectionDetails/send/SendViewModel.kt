@@ -36,8 +36,9 @@ class SendViewModel : ViewModel() {
     private val utxos: ArrayList<Utxo> = arrayListOf()
     private val selectedUtxos: ArrayList<Utxo> = arrayListOf()
     private var address: String = ""
-    private var amount: Double = 0.0
-    private var enteredAmount: Double = 0.0
+    /** #612: whole sats, never a Double. */
+    private var amountSats: Long = 0L
+    private var enteredAmountSats: Long = 0L
     var job: Job? = null
     private var selectedFee = 0L
 
@@ -292,24 +293,20 @@ class SendViewModel : ViewModel() {
             return block(SpendBlocker.WRONG_NETWORK)
         }
 
-        val dAmount: Double = enteredAmount
-        amount = (dAmount * 1e8)
+        amountSats = enteredAmountSats
 
-        if (dAmount == 0.0) {
+        if (amountSats <= 0L) {
             return block(SpendBlocker.NO_AMOUNT)
         }
 
         if (utxos.isEmpty()) {
             return block(SpendBlocker.NO_FUNDS)
         }
-        if (amount <= 0.0) {
-            return block(SpendBlocker.NO_AMOUNT)
-        }
         // Checked before composing so "more than you hold" is distinguishable
         // from a compose that failed for any other reason. The fee is not
         // known yet, so this does not catch an amount that only fails once the
         // fee is added; compose() still reports that as CANNOT_COMPOSE.
-        if (amount.toLong() > spendableSats()) {
+        if (amountSats > spendableSats()) {
             return block(SpendBlocker.INSUFFICIENT_FUNDS)
         }
         if (feeInvalid) {
@@ -324,7 +321,7 @@ class SendViewModel : ViewModel() {
             is CoinSelection.Resolution.Blocked -> return block(SpendBlocker.SELECTION_BLOCKED)
             is CoinSelection.Resolution.Missing -> return block(SpendBlocker.SELECTION_MISSING)
             is CoinSelection.Resolution.Pinned -> {
-                if (amount.toLong() > selection.totalSats) {
+                if (amountSats > selection.totalSats) {
                     return block(SpendBlocker.SELECTION_INSUFFICIENT)
                 }
                 selection.utxos
@@ -341,11 +338,11 @@ class SendViewModel : ViewModel() {
         job = viewModelScope.launch(Dispatchers.Default) {
             try {
                 receivers = HashMap()
-                receivers[address] = BigInteger.valueOf(amount.toLong())
+                receivers[address] = BigInteger.valueOf(amountSats)
                 try {
                     val isValid = transactionComposer.compose(
                         inputAddress = address,
-                        inputAmount = amount,
+                        inputAmountSats = amountSats,
                         inputFee = selectedFee,
                         inputUtxos = ArrayList<Utxo>(
                             utxosSelectableForSend(explicitInputs ?: utxos)
@@ -419,8 +416,12 @@ class SendViewModel : ViewModel() {
         return if (SentinelState.isTestNet()) hrp == "bc" else hrp == "tb"
     }
 
-    fun setAmount(amount: Double) {
-        enteredAmount = amount
+    /**
+     * #612: the amount in whole sats. The screen parses the BTC text
+     * with [SatsAmount.parseBtc]; nothing here goes through a Double.
+     */
+    fun setAmountSats(sats: Long) {
+        enteredAmountSats = sats
         prepareSpend()
     }
 

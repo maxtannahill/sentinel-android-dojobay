@@ -65,7 +65,7 @@ class TransactionComposer {
     private var selectedUtxos: ArrayList<UTXO> = arrayListOf()
     private var selectPubKeyModel: List<PubKeyModel?> = listOf();
     private var address: String = ""
-    private var amount: Double = 0.0
+    private var amount: Long = 0L
     private var selectedFee = 0L;
     private var receivers: HashMap<String, BigInteger> = hashMapOf()
     private var feeCallBack: ((Long, minerFee: Long) -> Unit)? = null;
@@ -96,12 +96,16 @@ class TransactionComposer {
      * passes are skipped. Fee, change and dust are computed the same way
      * against whichever set was selected, and the PSBT is assembled by the
      * same SendFactory.makeTransaction call either way.
+     *
+     * #612: [inputAmountSats] is whole sats. It used to be a Double that
+     * the screen had divided by 1e8 and multiplied back, which could land
+     * one sat low and then miss the spend-all branch below.
      */
     suspend fun compose(
         inputUtxos: ArrayList<Utxo>,
         inputAddress: String,
         inputFee: Long,
-        inputAmount: Double,
+        inputAmountSats: Long,
         explicitSelection: Boolean = false
     ): Boolean {
         composeMutex.withLock {
@@ -111,7 +115,7 @@ class TransactionComposer {
             receivers = hashMapOf()
             selectedUtxos = arrayListOf()
             balance = 0L
-            amount = inputAmount
+            amount = inputAmountSats
             address = inputAddress
             selectedFee = inputFee
             var totalValueSelected = 0L
@@ -143,7 +147,7 @@ class TransactionComposer {
             // sort in ascending order by value
             Collections.sort(utxos, UTXO.UTXOComparator())
             utxos.reverse()
-            receivers[address] = BigInteger.valueOf(amount.toLong())
+            receivers[address] = BigInteger.valueOf(amount)
             if (explicitSelection) {
                 // #190: the pinned set is the selection. No threshold loops.
                 if (utxos.isEmpty()) {
@@ -153,8 +157,8 @@ class TransactionComposer {
                     selectedUtxos.add(u)
                     totalValueSelected += u.value
                 }
-                if (totalValueSelected < amount.toLong()) {
-                    throw InsufficientSelectionException(totalValueSelected, amount.toLong())
+                if (totalValueSelected < amount) {
+                    throw InsufficientSelectionException(totalValueSelected, amount)
                 }
             }
             // get smallest 1 UTXO > than spend + fee + dust
@@ -210,7 +214,7 @@ class TransactionComposer {
                 }
             }
 
-            change = (totalValueSelected - (amount + fee!!.toLong())).toLong()
+            change = totalValueSelected - (amount + fee!!.toLong())
 
             // #190: this pre-fee check is skipped for a pinned set - a set
             // that covers the amount but not the fee would read as "dust"
@@ -236,7 +240,7 @@ class TransactionComposer {
                 outpointTypes.right,
                 2
             )
-            if (amount.toLong() == balance) {
+            if (amount == balance) {
                 fee = FeeUtil.getInstance().estimatedFeeSegwit(
                     outpointTypes.left,
                     outpointTypes.middle,
@@ -245,17 +249,17 @@ class TransactionComposer {
                 )
                 amount -= fee.toLong()
                 receivers.clear()
-                receivers[address] = BigInteger.valueOf(amount.toLong())
+                receivers[address] = BigInteger.valueOf(amount)
 
             }
 
-            change = (totalValueSelected - (amount + fee.toLong())).toLong()
+            change = totalValueSelected - (amount + fee.toLong())
             if (explicitSelection && change < 0L) {
                 // #190: the auto passes can always reach for another coin;
                 // a pinned set cannot. Say so rather than reporting dust.
                 throw InsufficientSelectionException(
                     totalValueSelected,
-                    (amount + fee.toLong()).toLong()
+                    amount + fee.toLong()
                 )
             }
             minerFeeChannel.send(fee.toLong())

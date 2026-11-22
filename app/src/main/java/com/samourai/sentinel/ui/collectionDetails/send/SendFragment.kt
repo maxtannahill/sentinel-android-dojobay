@@ -75,7 +75,7 @@ class SendFragment : Fragment() {
 
     private var isBTCEditing = false
     private var isFiatEditing = false
-    private var amount: Double = 0.0
+    private var amountSats: Long = 0L
     private var rate: ExchangeRateRepository.Rate = ExchangeRateRepository.Rate("", 0)
     private val exchangeRateRepository: ExchangeRateRepository by inject(ExchangeRateRepository::class.java)
     private var address: String = ""
@@ -202,19 +202,8 @@ class SendFragment : Fragment() {
             DecimalFormat.getNumberInstance().currency = Currency.getInstance(rate.currency)
         }
 
-        fragmentSpendBinding.fragmentComposeTx.totalBTC.setOnClickListener {
-            viewModel.setAmount(availableBalance.div(1e8))
-            setBtcEdit(decimalFormatBTC.format(availableBalance.div(1e8)).toString())
-            val fiatRate = availableBalance.div(1e8).times(rate.rate)
-            setFiatEdit(DecimalFormat.getNumberInstance().format(fiatRate))
-        }
-
-        fragmentSpendBinding.fragmentComposeTx.textView12.setOnClickListener {
-            viewModel.setAmount(availableBalance.div(1e8))
-            setBtcEdit(decimalFormatBTC.format(availableBalance.div(1e8)).toString())
-            val fiatRate = availableBalance.div(1e8).times(rate.rate)
-            setFiatEdit(DecimalFormat.getNumberInstance().format(fiatRate))
-        }
+        fragmentSpendBinding.fragmentComposeTx.totalBTC.setOnClickListener { spendAvailable() }
+        fragmentSpendBinding.fragmentComposeTx.textView12.setOnClickListener { spendAvailable() }
 
         watchAddressAndAmount()
 
@@ -674,7 +663,7 @@ class SendFragment : Fragment() {
             capped ?: accountSpendable
         }
         fragmentSpendBinding.fragmentComposeTx.totalBTC.text =
-            decimalFormatBTC.format(availableBalance.div(1e8)).toString() + " BTC"
+            decimalFormatBTC.format(SatsAmount.toBtc(availableBalance)).toString() + " BTC"
     }
 
     /**
@@ -752,29 +741,50 @@ class SendFragment : Fragment() {
             if (btcString.isEmpty()) {
                 setBtcEdit("")
                 setFiatEdit("")
+                // #612: an emptied field is no amount, not the last one typed.
+                amountSats = 0L
+                viewModel.setAmountSats(0L)
+                return
             }
             if (btcString.split(".").size > 1 && btcString.split(".")[1].length > 8) {
                 setBtcEdit(btcString.dropLast(btcString.split(".")[1].length-8))
                 return
             }
-            val btc: Double = btcString.toDouble()
-            amount = btc
-            if (btc > 21000000.0) {
-                setFiatEdit("")
-                setBtcEdit("")
+            // #612: exact decimal to sats. toDouble() then * 1e8 built
+            // 28,999,999 sats for 0.29.
+            val sats = SatsAmount.parseBtc(btcString)
+            if (sats == null) {
+                if (btcString.toDoubleOrNull()?.let { it > 21000000.0 } == true) {
+                    setFiatEdit("")
+                    setBtcEdit("")
+                }
                 return
             }
-            if (amount <= 0) {
+            amountSats = sats
+            if (amountSats <= 0L) {
                 fragmentSpendBinding.composeBtn.alpha = 0.6f
                 fragmentSpendBinding.composeBtn.isEnabled = false
                 return
             }
-            val fiatRate = btc.times(rate.rate)
-            setFiatEdit(DecimalFormat.getNumberInstance().format(fiatRate))
-            viewModel.setAmount(amount)
+            setFiatFor(amountSats)
+            viewModel.setAmountSats(amountSats)
         } catch (Ex: Exception) {
 
         }
+    }
+
+    /** The fiat field for [sats]. Display only; the amount stays in sats. */
+    private fun setFiatFor(sats: Long) {
+        val fiatRate = SatsAmount.toBtc(sats).toDouble().times(rate.rate)
+        setFiatEdit(DecimalFormat.getNumberInstance().format(fiatRate))
+    }
+
+    /** Tapping the available total: the BTC field gets that figure, exactly. */
+    private fun spendAvailable() {
+        amountSats = availableBalance
+        viewModel.setAmountSats(availableBalance)
+        setBtcEdit(SatsAmount.formatBtc(availableBalance))
+        setFiatFor(availableBalance)
     }
 
     private fun onFiatValueChange(fiatString: String) {
@@ -806,10 +816,12 @@ class SendFragment : Fragment() {
             else
                 setFiatEdit(DecimalFormat.getNumberInstance().format(fiat))
 
-            setBtcEdit(MonetaryUtil.getInstance().formatToBtc((btcRate * 1e8).toLong()))
-            val btc: Double = MonetaryUtil.getInstance().formatToBtc((btcRate * 1e8).toLong()).toDouble()
-            amount = btc
-            viewModel.setAmount(amount)
+            // #612: the sats this fiat figure converts to are the amount.
+            // Parsing the formatted BTC text back as a Double could move it.
+            val sats = (btcRate * 1e8).toLong()
+            setBtcEdit(MonetaryUtil.getInstance().formatToBtc(sats))
+            amountSats = sats
+            viewModel.setAmountSats(amountSats)
         } catch (Ex: Exception) {
 
         }
