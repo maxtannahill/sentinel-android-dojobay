@@ -572,6 +572,9 @@
     <string name="send_error_cannot_compose" translatable="false">Cannot build a transaction from these inputs</string>
     <!-- Prev-tx verification fails closed. The sentence does not name the input. -->
     <string name="send_error_prev_tx_unverified" translatable="false">Unable to verify the previous transaction</string>
+    <!-- #612: the Dojo did not answer the prev-tx fetch. Shown above COMPOSE with Retry. -->
+    <string name="send_error_dojo_unreachable" translatable="false">Could not reach Dojo</string>
+    <string name="send_retry" translatable="false">Retry</string>
     <!-- #282: one-time pairing password / backup password entry -->
     <string name="pairing_password_title" translatable="false">Enter one time pairing password</string>
     <string name="pairing_password_hint" translatable="false">Pairing password</string>

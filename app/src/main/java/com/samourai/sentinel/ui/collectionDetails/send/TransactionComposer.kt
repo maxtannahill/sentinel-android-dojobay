@@ -47,7 +47,18 @@ import java.util.Vector
  */
 class TransactionComposer {
 
-    data class ComposeException(private val displayMessage: String) : Exception(displayMessage)
+    open class ComposeException(displayMessage: String) : Exception(displayMessage)
+
+    /**
+     * #612: the previous transaction of an input could not be checked.
+     * [dojoUnreachable] is true when the Dojo did not answer usefully (a
+     * transport failure, an expired login the refresh could not renew, or
+     * a server error), so trying again can work. False when the Dojo
+     * answered and the answer did not verify. The message is the same
+     * generic sentence either way and names no input.
+     */
+    class PrevTxException(val dojoUnreachable: Boolean, displayMessage: String) :
+        ComposeException(displayMessage)
 
     /**
      * #190: a pinned (explicit) input set that cannot cover the amount plus
@@ -73,6 +84,18 @@ class TransactionComposer {
     private val apiService: ApiService by KoinJavaComponent.inject(ApiService::class.java)
     private val HARDENED = 2147483648
     private val composeMutex = Mutex()
+
+    /**
+     * #612: prev-tx hex by txid, kept for the life of this composer (one
+     * Send screen) once it has hashed to its txid. A prev tx never changes,
+     * so a recompose (fee slider, a new coin, Retry) does not fetch every
+     * input over Tor again. The output index, value and script are still
+     * checked against it on every compose. Only touched under [composeMutex].
+     */
+    private val verifiedPrevTxHex = object : LinkedHashMap<String, String>() {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
+            size > PREV_TX_CACHE_MAX
+    }
 
     fun setBalance(value: Long) {
         this.balance = value;
@@ -543,6 +566,8 @@ class TransactionComposer {
      * sentence. It does not carry the input txid or the HTTP status, and
      * this path does not log them.
      *
+     * #612: the hex is fetched once per Send screen; see [verifiedPrevTxHex].
+     *
      * The hash check compares Transaction.getHash objects: getHash()
      * serializes with TransactionOptions.NONE (no witness bytes, no
      * marker/flag) before the double-SHA256, which is exactly the txid Dojo
@@ -552,29 +577,8 @@ class TransactionComposer {
      */
     private suspend fun verifyPrevTx(outPoint: MyTransactionOutPoint): kotlin.Triple<String, Long, ByteArray> {
         val txid = outPoint.hash.toString()
-        // #503: same transport as the sweep prev-tx fetch. getTxHex caps
-        // the body while the socket is read; a check of the string below
-        // would already be holding the whole response.
-        val response = try {
-            apiService.getTxHex(txid)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            throw unverifiedPrevTx(e)
-        }
-        if (!response.isSuccessful) {
-            throw unverifiedPrevTx()
-        }
-        val hex = try {
-            val body = response.body?.string()
-            val json = body?.let { SafeJson.parseObject(it) }
-            if (json != null && json.has("data")) json.getString("data") else null
-        } catch (e: Exception) {
-            null
-        }
-        if (hex.isNullOrEmpty()) {
-            throw unverifiedPrevTx()
-        }
+        val cached = verifiedPrevTxHex[txid]
+        val hex = cached ?: fetchPrevTxHex(txid)
         val prevTx = try {
             Transaction(SentinelState.getNetworkParam(), Hex.decodeHex(hex.toCharArray()))
         } catch (e: Exception) {
@@ -582,6 +586,9 @@ class TransactionComposer {
         }
         if (prevTx.hash != outPoint.hash) {
             throw unverifiedPrevTx()
+        }
+        if (cached == null) {
+            verifiedPrevTxHex[txid] = hex
         }
         val outputIndex = outPoint.txOutputN
         if (outputIndex < 0 || outputIndex >= prevTx.outputs.size) {
@@ -601,12 +608,52 @@ class TransactionComposer {
     }
 
     /**
+     * The prev-tx hex for [txid] from the Dojo. getTxHex refreshes an
+     * expired login once and resends (the same retry Rescan Xpub uses), so
+     * a 401 that reaches here is one the refresh could not fix.
+     */
+    private suspend fun fetchPrevTxHex(txid: String): String {
+        // #503: same transport as the sweep prev-tx fetch. getTxHex caps
+        // the body while the socket is read; a check of the string below
+        // would already be holding the whole response.
+        val response = try {
+            apiService.getTxHex(txid)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: com.samourai.sentinel.util.ImportTooLargeException) {
+            // The Dojo answered, with more than a prev tx can be.
+            throw unverifiedPrevTx(e)
+        } catch (e: Exception) {
+            throw unverifiedPrevTx(e, dojoUnreachable = true)
+        }
+        if (!response.isSuccessful) {
+            val code = response.code
+            response.close()
+            throw unverifiedPrevTx(dojoUnreachable = isDojoUnavailableStatus(code))
+        }
+        val hex = try {
+            val body = response.body?.string()
+            val json = body?.let { SafeJson.parseObject(it) }
+            if (json != null && json.has("data")) json.getString("data") else null
+        } catch (e: Exception) {
+            null
+        }
+        if (hex.isNullOrEmpty()) {
+            throw unverifiedPrevTx()
+        }
+        return hex
+    }
+
+    /**
      * Same refusal for every closed failure in [verifyPrevTx]. The text
      * is the resource, so a log of the exception and any UI that shows
      * [ComposeException.message] stay on that sentence.
      */
-    private fun unverifiedPrevTx(cause: Exception? = null): ComposeException {
-        val failure = ComposeException(unverifiedPrevTxMessage())
+    private fun unverifiedPrevTx(
+        cause: Exception? = null,
+        dojoUnreachable: Boolean = false,
+    ): ComposeException {
+        val failure = PrevTxException(dojoUnreachable, unverifiedPrevTxMessage())
         if (cause != null) failure.initCause(cause)
         return failure
     }
@@ -701,6 +748,17 @@ class TransactionComposer {
 
     companion object {
         private const val TAG = "TransactionComposer"
+
+        /** Prev txs kept per Send screen. A max send of more coins refetches the rest. */
+        internal const val PREV_TX_CACHE_MAX = 500
+
+        /**
+         * #612: answers that mean the Dojo could not serve the request
+         * right now (login, rate limit, server or gateway trouble), as
+         * opposed to answering about the transaction itself.
+         */
+        internal fun isDojoUnavailableStatus(code: Int): Boolean =
+            code == 401 || code == 403 || code == 408 || code == 429 || code >= 500
     }
 
 }

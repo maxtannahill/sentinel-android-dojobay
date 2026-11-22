@@ -267,6 +267,101 @@ class SpendAllComposeTest {
         assertEquals(12_000_000L, vm.selectableSpendable.value)
     }
 
+    @Test
+    fun anExpiredTokenOnThePrevTxFetchIsRefreshedOnceAndComposeSucceeds() {
+        // Before the expired-token retry this was one 401, no refresh and
+        // "Cannot build a transaction from these inputs".
+        val coins = listOf(wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1))
+        mode = Mode.EXPIRED_UNTIL_REFRESH
+        val tx = compose(coins, 19_506_493L, spendAll = true)
+        assertEquals(1, tx.outputs.size)
+        assertEquals("one refresh for the whole compose", 1, authRequests.get())
+        assertEquals("one 401, its resend, then the second input", 3, hexRequests.get())
+    }
+
+    @Test
+    fun anExpiredTokenTheRefreshCannotRenewIsReportedAsDojoUnreachable() {
+        val coins = listOf(wallet.funded(12_000_000L, 0))
+        mode = Mode.EXPIRED_REFRESH_REFUSED
+        val failed = composeFailure(coins, 5_000_000L)
+        assertTrue(failed is TransactionComposer.PrevTxException)
+        assertTrue((failed as TransactionComposer.PrevTxException).dojoUnreachable)
+        assertEquals("no resend after a failed refresh", 1, hexRequests.get())
+        assertEquals(1, authRequests.get())
+    }
+
+    @Test
+    fun aDojoThatDoesNotAnswerIsToldApartFromAPrevTxThatDoesNotVerify() {
+        val coin = wallet.funded(12_000_000L, 0)
+        for (unreachable in listOf(Mode.UNAVAILABLE, Mode.DROP)) {
+            mode = unreachable
+            val failed = composeFailure(listOf(coin), 5_000_000L)
+            assertTrue("$unreachable ${failed.javaClass.simpleName} ${failed.cause}", (failed as TransactionComposer.PrevTxException).dojoUnreachable)
+        }
+        mode = Mode.SERVE
+        // The Dojo answers, but about a coin it does not know ...
+        val unknown = wallet.funded(3_000_000L, 1)
+        forget(unknown)
+        val notFound = composeFailure(listOf(unknown), 1_000_000L)
+        assertTrue(!(notFound as TransactionComposer.PrevTxException).dojoUnreachable)
+        // ... or with a prev tx whose output is not the value the coin claims.
+        val lying = wallet.funded(4_000_000L, 2).withValue(4_000_001L)
+        val mismatch = composeFailure(listOf(lying), 1_000_000L)
+        assertTrue(!(mismatch as TransactionComposer.PrevTxException).dojoUnreachable)
+        assertEquals(
+            ApplicationProvider.getApplicationContext<Application>()
+                .getString(com.samourai.sentinel.R.string.send_error_prev_tx_unverified),
+            mismatch.message
+        )
+
+        assertTrue(TransactionComposer.isDojoUnavailableStatus(401))
+        assertTrue(TransactionComposer.isDojoUnavailableStatus(503))
+        assertTrue(TransactionComposer.isDojoUnavailableStatus(429))
+        assertTrue(!TransactionComposer.isDojoUnavailableStatus(404))
+        assertTrue(!TransactionComposer.isDojoUnavailableStatus(400))
+    }
+
+    @Test
+    fun verifiedPrevTxsAreFetchedOncePerSendScreenAndStillChecked() {
+        val coins = (0 until 8).map { wallet.funded(1_000_000L + it, it) }
+        val total = coins.sumOf { it.utxo.value!! }
+        val composer = composer()
+        compose(coins, total, spendAll = true, composer = composer)
+        assertEquals("a max send fetches every coin once", 8, hexRequests.getAndSet(0))
+        compose(coins, total, spendAll = true, composer = composer)
+        compose(coins, 50_000L, composer = composer)
+        assertEquals("a recompose on the same screen fetches nothing", 0, hexRequests.get())
+
+        // The cached prev tx is still held against the coin on every compose.
+        val lying = listOf(coins[0].withValue(1_000_007L))
+        val failed = composeFailure(lying, 500_000L, composer = composer)
+        assertTrue(failed is TransactionComposer.PrevTxException)
+        assertEquals(0, hexRequests.get())
+
+        // A new Send screen has a new composer and fetches again.
+        compose(coins.take(1), 500_000L)
+        assertEquals(1, hexRequests.get())
+    }
+
+    @Test
+    fun aDojoFailureShowsItsOwnReasonAndRetryComposesAgain() {
+        val coins = listOf(wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1))
+        val vm = viewModel(coins)
+        mode = Mode.UNAVAILABLE
+        vm.setSpendAll(19_506_493L)
+        vm.settle()
+        assertEquals(SendViewModel.SpendBlocker.DOJO_UNREACHABLE, vm.spendBlocker.value)
+        assertTrue(vm.spendBlocker.value!!.canRetry)
+        assertEquals(false, vm.validSpend.value)
+
+        mode = Mode.SERVE
+        vm.retryCompose()
+        vm.settle()
+        assertEquals(SendViewModel.SpendBlocker.NONE, vm.spendBlocker.value)
+        assertEquals(true, vm.validSpend.value)
+        assertTrue(!SendViewModel.SpendBlocker.CANNOT_COMPOSE.canRetry)
+    }
+
     // Fixture
 
     private fun composer() = TransactionComposer().apply { setPubKey(listOf(wallet.pub)) }
@@ -353,6 +448,15 @@ class SpendAllComposeTest {
         }
         repeat(3) { looper.idle() }
     }
+
+    /** The fake Dojo no longer knows [coin]'s funding tx. */
+    private fun forget(coin: FundedUtxo) {
+        served.remove(coin.utxo.txHash)
+    }
+
+    /** The same outpoint, claiming [value] sats. */
+    private fun FundedUtxo.withValue(value: Long): FundedUtxo =
+        FundedUtxo(utxo.copy(value = value), hex)
 
     private fun feeFor(tx: Transaction, coins: List<FundedUtxo>): Long =
         coins.sumOf { it.utxo.value!! } - tx.outputs.sumOf { it.value.value }
@@ -511,7 +615,7 @@ class SpendAllComposeTest {
                         Mode.UNAVAILABLE ->
                             return MockResponse().setResponseCode(503).setBody("""{"status":"error"}""")
                         Mode.DROP ->
-                            return MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START)
+                            return MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST)
                     }
                     val txid = path.substringAfter("/tx/").substringBefore("/HEX")
                     val hex = served[txid]

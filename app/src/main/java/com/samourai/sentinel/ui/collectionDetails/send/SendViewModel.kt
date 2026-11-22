@@ -127,7 +127,21 @@ class SendViewModel : ViewModel() {
          * #77: the custom fee field holds no usable rate (empty, not a
          * number, or out of range). The field says which.
          */
-        INVALID_FEE
+        INVALID_FEE,
+        /**
+         * #612: the Dojo answered, but an input's previous transaction did
+         * not verify. The screen offers Retry.
+         */
+        PREV_TX_UNVERIFIED,
+        /**
+         * #612: the Dojo could not be reached, or would not serve the
+         * previous transactions (a login the refresh could not renew, a
+         * server error). The screen offers Retry.
+         */
+        DOJO_UNREACHABLE;
+
+        /** #612: a failure that trying again can fix, so the screen offers Retry. */
+        val canRetry: Boolean get() = this == PREV_TX_UNVERIFIED || this == DOJO_UNREACHABLE
     }
 
     /** #566: [makeTx] did not take a snapshot. */
@@ -408,6 +422,19 @@ class SendViewModel : ViewModel() {
                     viewModelScope.launch(Dispatchers.Main) {
                         if (generation == spendGeneration) block(SpendBlocker.SELECTION_INSUFFICIENT)
                     }
+                } catch (e: TransactionComposer.PrevTxException) {
+                    // #612: was the generic CANNOT_COMPOSE. Say which, and
+                    // let the user retry instead of waiting for a sync to
+                    // happen to recompose.
+                    Timber.i("Compose stopped: previous transaction not verified")
+                    val reason = if (e.dojoUnreachable) {
+                        SpendBlocker.DOJO_UNREACHABLE
+                    } else {
+                        SpendBlocker.PREV_TX_UNVERIFIED
+                    }
+                    viewModelScope.launch(Dispatchers.Main) {
+                        if (generation == spendGeneration) block(reason)
+                    }
                 } catch (e: com.samourai.sentinel.api.ApiService.ApiNotConfigured) {
                     // #125: compose() reaches getTxHex (:351/:375) -> buildClient ->
                     // getAPIUrl, throwing this on an unpaired install. Throwable, so the
@@ -415,9 +442,10 @@ class SendViewModel : ViewModel() {
                     // throw would have escaped the compose job from the send screen. Same
                     // degrade as :132-136. FQN deliberate: this file has no ApiService
                     // import; simple-name cleanup may follow.
+                    // #612: reported as Dojo unreachable, with Retry.
                     Timber.e(e, "Compose aborted: no API endpoint configured")
                     viewModelScope.launch(Dispatchers.Main) {
-                        if (generation == spendGeneration) block(SpendBlocker.CANNOT_COMPOSE)
+                        if (generation == spendGeneration) block(SpendBlocker.DOJO_UNREACHABLE)
                     }
                 } catch (e: Exception) {
                     viewModelScope.launch(Dispatchers.Main) {
@@ -469,6 +497,14 @@ class SendViewModel : ViewModel() {
         enteredAmountSats = sats
         spendAll = false
         _spendAllSentSats.value = null
+        prepareSpend()
+    }
+
+    /**
+     * #612: Retry on a Dojo or prev-tx failure. Composes the same inputs
+     * again; prev txs that already verified are not fetched again.
+     */
+    fun retryCompose() {
         prepareSpend()
     }
 

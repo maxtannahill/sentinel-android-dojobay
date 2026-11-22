@@ -268,6 +268,7 @@ class SendFragment : Fragment() {
 
         // #294: say why the button is disabled, on the field responsible.
         viewModel.spendBlocker.observe(viewLifecycleOwner) { showSpendBlocker(it) }
+        fragmentSpendBinding.composeRetryBtn.setOnClickListener { viewModel.retryCompose() }
         viewModel.unsyncedXpubNote.observe(viewLifecycleOwner) { note ->
             val label = fragmentSpendBinding.fragmentComposeTx.unsyncedXpubNote
             label.text = note.orEmpty()
@@ -627,6 +628,27 @@ class SendFragment : Fragment() {
         }
         fragmentSpendBinding.toEditText.error = addressError
         fragmentSpendBinding.btcEditTextLayout.error = amountError
+        showComposeStatus(blocker)
+    }
+
+    /**
+     * #612: a Dojo or prev-tx failure is not the amount's fault, so it is
+     * shown above COMPOSE with Retry instead of under BTC. It used to read
+     * "Cannot build a transaction from these inputs" with no way to retry.
+     */
+    private fun showComposeStatus(blocker: SendViewModel.SpendBlocker) {
+        val status = when (blocker) {
+            SendViewModel.SpendBlocker.DOJO_UNREACHABLE ->
+                getString(R.string.send_error_dojo_unreachable)
+            SendViewModel.SpendBlocker.PREV_TX_UNVERIFIED ->
+                getString(R.string.send_error_prev_tx_unverified)
+            else -> null
+        }
+        fragmentSpendBinding.composeStatusText.text = status.orEmpty()
+        fragmentSpendBinding.composeRetryBtn.visibility =
+            if (blocker.canRetry) View.VISIBLE else View.GONE
+        fragmentSpendBinding.composeStatusRow.visibility =
+            if (status != null) View.VISIBLE else View.GONE
     }
 
     /**
