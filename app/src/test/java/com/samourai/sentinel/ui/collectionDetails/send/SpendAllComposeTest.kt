@@ -3,6 +3,7 @@ package com.samourai.sentinel.ui.collectionDetails.send
 import android.app.Application
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
+import com.samourai.sentinel.R
 import com.samourai.sentinel.api.ApiService
 import com.samourai.sentinel.core.SentinelState
 import com.samourai.sentinel.core.hd.HD_Account
@@ -390,6 +391,10 @@ class SpendAllComposeTest {
         vm.setSpendAll(19_506_493L)
         shadowOf(Looper.getMainLooper()).idle()
         assertEquals(SendViewModel.SpendBlocker.COMPOSING, vm.spendBlocker.value)
+        assertEquals(
+            "Verifying unspents with Dojo…",
+            ApplicationProvider.getApplicationContext<Application>().getString(R.string.send_composing),
+        )
         assertEquals(false, vm.validSpend.value)
         assertEquals("no fee while the Dojo is still being asked", "", vm.minerFee.value)
         vm.settle()
