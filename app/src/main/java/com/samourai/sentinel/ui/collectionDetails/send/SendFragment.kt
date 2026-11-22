@@ -96,6 +96,8 @@ class SendFragment : Fragment() {
     private var availableBalance: Long = 0L
     // #190: the account's spendable figure; availableBalance is this, or the
     // pinned coins' total while a manual selection is in force.
+    // #612: only shown until the account's coins load; after that the
+    // figure is the ViewModel's selectableSpendable, summed from the coins.
     private var accountSpendable: Long = 0L
 
     // #385: one open per destination. A second tap while the first
@@ -253,9 +255,10 @@ class SendFragment : Fragment() {
             closeUnsignedScreen()
         }
         // A do-not-spend mark does not rewrite the UTXO rows, so the
-        // table observer never sees a freeze on its own.
+        // table observer never sees a freeze on its own. #612: the figure
+        // and the pool compose spends are re-derived with it.
         UtxoMetaUtil.blockedChanges.observe(viewLifecycleOwner) {
-            viewModel.recheckReviewedInputs()
+            viewModel.onDoNotSpendChanged()
         }
 
         viewModel.validSpend.observe(viewLifecycleOwner) {
@@ -665,13 +668,15 @@ class SendFragment : Fragment() {
     }
 
     private fun showAvailable() {
+        if (_fragmentSpendBinding == null) return
         val pinnedTotal = viewModel.pinnedTotal.value
         val pinned = !viewModel.pinnedOutpoints.value.isNullOrEmpty()
-        val capped = viewModel.selectableSpendable.value
+        // #612: the sum of the coins compose spends (#612 fix 1).
+        val pool = viewModel.selectableSpendable.value
         availableBalance = if (pinned && pinnedTotal != null) {
             pinnedTotal
         } else {
-            capped ?: accountSpendable
+            pool ?: accountSpendable
         }
         fragmentSpendBinding.fragmentComposeTx.totalBTC.text =
             decimalFormatBTC.format(SatsAmount.toBtc(availableBalance)).toString() + " BTC"
@@ -872,6 +877,12 @@ class SendFragment : Fragment() {
 
     fun setCollection(mCollection: PubKeyCollection) {
         this.mCollection = mCollection
+        // #612: a sync pushes the collection once per key. The figure was
+        // only redrawn on resume, a From change or a coin-control change.
+        if (_fragmentSpendBinding != null && isAdded) {
+            viewModel.onCollectionUpdated()
+            showAvailable()
+        }
     }
 
     fun setDropDownPub(index: Int) {
@@ -997,6 +1008,9 @@ class SendFragment : Fragment() {
      * subtractions. The spend LOGIC side (SendViewModel.spendableSats
      * and the compose input filter) already excluded blocked coins and
      * is untouched; this is the displayed figure only.
+     *
+     * #612: shown only until the account's coins load. The synced
+     * balances can run ahead of the coins during a sync.
      */
     private fun setBalance(pub: PubKeyModel) {
 

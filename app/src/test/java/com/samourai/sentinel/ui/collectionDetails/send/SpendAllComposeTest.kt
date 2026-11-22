@@ -10,11 +10,14 @@ import com.samourai.sentinel.data.AddressTypes
 import com.samourai.sentinel.data.PubKeyModel
 import com.samourai.sentinel.data.Utxo
 import com.samourai.sentinel.data.db.SentinelCollectionStore
+import com.samourai.sentinel.data.repository.PubSyncHealth
+import com.samourai.sentinel.data.repository.SyncFailureKind
 import com.samourai.sentinel.data.repository.CollectionRepository
 import com.samourai.sentinel.send.FeeUtil
 import com.samourai.sentinel.send.SuggestedFee
 import com.samourai.sentinel.ui.dojo.DojoUtility
 import com.samourai.sentinel.ui.utils.PrefsUtil
+import com.samourai.sentinel.util.UtxoMetaUtil
 import com.samourai.wallet.segwit.SegwitAddress
 import com.samourai.wallet.segwit.bech32.Bech32UtilGeneric
 import com.samourai.wallet.util.XPUB
@@ -189,6 +192,79 @@ class SpendAllComposeTest {
         assertTrue(!vm.isSpendAll())
         assertEquals(null, vm.spendAllSentSats.value)
         assertEquals(true, vm.validSpend.value)
+    }
+
+    @Test
+    fun theFigureIsTheSumOfTheCoinsComposeSpends() {
+        val coins = listOf(wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1))
+        val vm = viewModel(coins)
+        assertEquals(19_506_493L, vm.selectableSpendable.value)
+    }
+
+    @Test
+    fun aDoNotSpendCoinLeavesTheFigureAndAMarkOnASpentCoinDoesNot() {
+        val kept = wallet.funded(12_000_000L, 0)
+        val frozen = wallet.funded(7_506_493L, 1)
+        val spent = wallet.funded(3_000_000L, 2)
+        val vm = viewModel(listOf(kept, frozen))
+        try {
+            UtxoMetaUtil.put(frozen.utxo)
+            vm.onDoNotSpendChanged()
+            vm.settle()
+            assertEquals(12_000_000L, vm.selectableSpendable.value)
+
+            // A mark whose coin is no longer in the pool used to keep
+            // subtracting its stored amount until the next sync.
+            UtxoMetaUtil.put(spent.utxo)
+            vm.onDoNotSpendChanged()
+            vm.settle()
+            assertEquals(12_000_000L, vm.selectableSpendable.value)
+
+            vm.setSpendAll(12_000_000L)
+            vm.settle()
+            assertEquals(true, vm.validSpend.value)
+            assertTrue(vm.spendAllSentSats.value!! < 12_000_000L)
+        } finally {
+            UtxoMetaUtil.remove(frozen.utxo.txHash!!, 0)
+            UtxoMetaUtil.remove(spent.utxo.txHash!!, 0)
+        }
+        assertEquals(0L, spendableTotal(emptyList()) { true })
+    }
+
+    @Test
+    fun aCoinArrivingOnSendRedrawsTheFigureAndSpendAllIncludesIt() {
+        val first = listOf(wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1))
+        val vm = viewModel(first)
+        vm.setSpendAll(19_506_493L)
+        vm.settle()
+        val before = vm.spendAllSentSats.value!!
+
+        val arrived = first + wallet.funded(50_000L, 2)
+        vm.applySelectableUtxos(arrived.map { it.utxo })
+        vm.settle()
+        assertEquals(19_556_493L, vm.selectableSpendable.value)
+        assertEquals(true, vm.validSpend.value)
+        val after = vm.spendAllSentSats.value!!
+        assertTrue("the new coin is spent too", after > before + 49_000L)
+    }
+
+    @Test
+    fun aCollectionUpdateRedrawsTheFigureWhenAnXpubIsHiddenOrBack() {
+        val coins = listOf(wallet.funded(12_000_000L, 0))
+        val vm = viewModel(coins)
+        assertEquals(12_000_000L, vm.selectableSpendable.value)
+        try {
+            PubSyncHealth.markFailed(wallet.zpub, SyncFailureKind.TRANSPORT)
+            vm.onCollectionUpdated()
+            vm.settle()
+            assertEquals(0L, vm.selectableSpendable.value)
+            assertEquals(SendViewModel.SpendBlocker.NO_FUNDS, vm.spendBlocker.value)
+        } finally {
+            PubSyncHealth.clear(wallet.zpub)
+        }
+        vm.onCollectionUpdated()
+        vm.settle()
+        assertEquals(12_000_000L, vm.selectableSpendable.value)
     }
 
     // Fixture

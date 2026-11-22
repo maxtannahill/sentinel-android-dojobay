@@ -88,7 +88,13 @@ class PsbtFileExportSourceTest {
         assertFalse(clear.contains("PSBT_transaction"))
 
         assertTrue(send.contains("viewModel.freshReview.observe"))
-        assertTrue(send.contains("viewModel.recheckReviewedInputs()"))
+        // #612: a mark change re-derives the pool, which runs the same
+        // reviewed-input check (or recheckReviewedInputs with no rows yet).
+        assertTrue(send.contains("viewModel.onDoNotSpendChanged()"))
+        val marks = vm.substringAfter("fun onDoNotSpendChanged() {")
+            .substringBefore("private fun hiddenPubs")
+        assertTrue(marks.contains("recheckReviewedInputs()"))
+        assertTrue(marks.contains("applySelectableUtxos(lastRawUtxos)"))
         assertTrue(send.contains("UtxoMetaUtil.blockedChanges.observe"))
         assertTrue(helper.contains(".use {"))
         assertTrue(helper.contains("catch (t: Throwable)"))

@@ -13,6 +13,7 @@ import com.samourai.sentinel.data.PubKeyModel
 import com.samourai.sentinel.data.Utxo
 import com.samourai.sentinel.core.SentinelState
 import com.samourai.sentinel.data.db.dao.UtxoDao
+import com.samourai.sentinel.data.repository.PubSyncHealth
 import com.samourai.wallet.psbt.PSBT
 import org.bouncycastle.util.encoders.Hex
 import com.samourai.sentinel.send.FeeUtil
@@ -141,8 +142,19 @@ class SendViewModel : ViewModel() {
     val spendBlocker: LiveData<SpendBlocker> = _spendBlocker
 
     /**
-     * Set while at least one XPUB in this account failed its last sync.
-     * Null when every XPUB here synced, so the screen keeps its own figure.
+     * #612: the Total available amount figure, taken from the same coin
+     * list compose spends: this account's UTXO rows, without coins of an
+     * XPUB whose last sync failed and without do-not-spend coins.
+     *
+     * It used to be published only while an XPUB was hidden, and the
+     * screen otherwise showed the synced PubKeyModel balances minus the
+     * stored do-not-spend amounts. A sync writes those balances key by
+     * key before it saves the UTXO rows, and a mark on a coin that has
+     * since been spent kept subtracting its stored amount, so the figure
+     * and the coins disagreed. A do-not-spend mark only counts here while
+     * its coin is still in the pool.
+     *
+     * Null until this account's coins have loaded.
      */
     private val _selectableSpendable = MutableLiveData<Long?>(null)
     val selectableSpendable: LiveData<Long?> = _selectableSpendable
@@ -151,6 +163,9 @@ class SendViewModel : ViewModel() {
     val unsyncedXpubNote: LiveData<String?> = _unsyncedXpubNote
 
     private var lastRawUtxos: List<Utxo> = emptyList()
+
+    /** #612: the XPUBs hidden by the last [applySelectableUtxos]. */
+    private var lastHiddenPubs: Set<String> = emptySet()
 
     private fun block(reason: SpendBlocker): Boolean {
         _spendBlocker.postValue(reason)
@@ -216,8 +231,7 @@ class SendViewModel : ViewModel() {
     }
 
     /** Spendable total, excluding anything marked do-not-spend. */
-    private fun spendableSats(): Long =
-        utxos.filter { !UtxoMetaUtil.has(it) }.sumOf { it.value ?: 0L }
+    private fun spendableSats(): Long = spendableTotal(utxos) { UtxoMetaUtil.has(it) }
 
 
     init {
@@ -246,6 +260,10 @@ class SendViewModel : ViewModel() {
         spendAll = false
         _spendAllSentSats.value = null
         _pinnedTotal.value = null
+        // #612: the figure belongs to the account whose coins it sums.
+        _selectableSpendable.value = null
+        lastRawUtxos = emptyList()
+        lastHiddenPubs = emptySet()
         // #190: each account switch used to add another observer and leave
         // the previous account's attached, so its next emission replaced the
         // pool with the wrong account's coins - which the picker now lists.
@@ -479,17 +497,44 @@ class SendViewModel : ViewModel() {
         applySelectableUtxos(lastRawUtxos)
     }
 
+    /**
+     * #612: the collection was updated (a sync pushes it once per key).
+     * The coins themselves arrive through the UTXO table observer; what
+     * can change here without a row write is which XPUBs are hidden for a
+     * failed sync. Re-apply only then, so a sync does not recompose once
+     * per key for nothing.
+     */
+    fun onCollectionUpdated() {
+        if (lastRawUtxos.isEmpty()) return
+        if (hiddenPubs(lastRawUtxos) != lastHiddenPubs) {
+            applySelectableUtxos(lastRawUtxos)
+        }
+    }
+
+    /**
+     * #612: a do-not-spend mark changed. Marks do not rewrite the UTXO
+     * rows, so the figure and the pool are re-derived from the last rows,
+     * and a reviewed input that is now frozen still closes the review.
+     */
+    fun onDoNotSpendChanged() {
+        if (lastRawUtxos.isEmpty()) {
+            recheckReviewedInputs()
+            return
+        }
+        applySelectableUtxos(lastRawUtxos)
+    }
+
+    private fun hiddenPubs(raw: List<Utxo>): Set<String> =
+        raw.map { it.pubKey }.filter { PubSyncHealth.isHidden(it) }.toSet()
+
     @VisibleForTesting
     internal fun applySelectableUtxos(raw: List<Utxo>) {
         lastRawUtxos = raw
+        lastHiddenPubs = hiddenPubs(raw)
         val hidden = hiddenXpubCount(raw)
         _unsyncedXpubNote.value = unsyncedXpubNote(hidden)
         val visible = utxosSelectableForSend(raw)
-        _selectableSpendable.value = if (hidden == 0) {
-            null
-        } else {
-            visible.filter { !UtxoMetaUtil.has(it) }.sumOf { it.value ?: 0L }
-        }
+        _selectableSpendable.value = spendableTotal(visible) { UtxoMetaUtil.has(it) }
         utxos.clear()
         utxos.addAll(visible)
         _utxoPool.value = visible
@@ -678,3 +723,11 @@ class SendViewModel : ViewModel() {
         val outpoints: Set<String>,
     )
 }
+
+/**
+ * #612: the spendable total of [pool], the coins compose would be given.
+ * A do-not-spend mark only removes a coin that is in [pool], so a mark on
+ * a coin that has since been spent no longer lowers the figure.
+ */
+internal fun spendableTotal(pool: List<Utxo>, isBlocked: (Utxo) -> Boolean): Long =
+    pool.filter { !isBlocked(it) }.sumOf { it.value ?: 0L }
