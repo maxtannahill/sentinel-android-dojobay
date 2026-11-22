@@ -195,6 +195,26 @@ class SpendAllComposeTest {
     }
 
     @Test
+    fun droppingASpendAllKeepsTheNetAmountTheFieldShows() {
+        val coins = listOf(wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1))
+        val composer = composer()
+        val vm = viewModel(coins, composer)
+        vm.setSpendAll(19_506_493L)
+        vm.settle()
+        val sent = vm.spendAllSentSats.value!!
+        assertTrue(sent < 19_506_493L)
+
+        // An account change drops spend-all, and the field still shows
+        // sent. The next account's coins compose that as a typed amount.
+        vm.dropSpendAll()
+        vm.applySelectableUtxos(listOf(wallet.funded(30_000_000L, 2).utxo))
+        vm.settle()
+        assertTrue(!vm.isSpendAll())
+        assertEquals(true, vm.validSpend.value)
+        assertEquals(sent, composer.getComposedAmountSats())
+    }
+
+    @Test
     fun theFigureIsTheSumOfTheCoinsComposeSpends() {
         val coins = listOf(wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1))
         val vm = viewModel(coins)

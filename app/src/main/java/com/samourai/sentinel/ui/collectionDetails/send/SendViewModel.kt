@@ -287,9 +287,8 @@ class SendViewModel : ViewModel() {
         // #190: a pin belongs to the account it was made against.
         _pinnedOutpoints.value = emptySet()
         // #612: "spend all" was a tap on the other account's total. The
-        // figure that tap put in the field stays as a typed amount.
-        spendAll = false
-        _spendAllSentSats.value = null
+        // figure in the field stays as a typed amount.
+        dropSpendAll()
         _pinnedTotal.value = null
         // #612: the figure belongs to the account whose coins it sums.
         _selectableSpendable.value = null
@@ -432,6 +431,9 @@ class SendViewModel : ViewModel() {
                     withContext(Dispatchers.Main) {
                         if (generation != spendGeneration) return@withContext
                         _spendAllSentSats.value = if (isValid && spendAll) sent else null
+                        // #612: the field now shows what the spend-all sends,
+                        // so that is the amount if spend-all is dropped.
+                        if (isValid && spendAll && sent != null) enteredAmountSats = sent
                         _minerFee.postValue(if (isValid && fee != null) formatFee(fee) else "")
                         _validSpend.postValue(isValid)
                         _spendBlocker.postValue(
@@ -533,8 +535,9 @@ class SendViewModel : ViewModel() {
     /**
      * #612: the available total was tapped. Compose spends every spendable
      * coin (do-not-spend excluded, the pinned set while coins are pinned)
-     * to one output, whatever [displayedSats] says. [displayedSats] is kept
-     * as the typed amount if spend-all is later dropped by an account change.
+     * to one output, whatever [displayedSats] says. [displayedSats], then
+     * the net amount once a compose succeeds, is the typed amount if
+     * spend-all is later dropped by an account change.
      */
     fun setSpendAll(displayedSats: Long) {
         enteredAmountSats = displayedSats
@@ -544,6 +547,17 @@ class SendViewModel : ViewModel() {
     }
 
     internal fun isSpendAll(): Boolean = spendAll
+
+    /**
+     * #612: the account changed under a spend-all. What the field shows
+     * (the last spend-all's net amount, or the tapped figure if none
+     * composed) becomes a typed amount.
+     */
+    @VisibleForTesting
+    internal fun dropSpendAll() {
+        spendAll = false
+        _spendAllSentSats.value = null
+    }
 
     private val utxoObserver: Observer<List<Utxo>> = Observer { raw ->
         applySelectableUtxos(raw)
