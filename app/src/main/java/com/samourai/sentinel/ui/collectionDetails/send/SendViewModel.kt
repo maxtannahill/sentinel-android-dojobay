@@ -1,5 +1,6 @@
 package com.samourai.sentinel.ui.collectionDetails.send
 
+import androidx.annotation.VisibleForTesting
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
@@ -39,6 +40,21 @@ class SendViewModel : ViewModel() {
     /** #612: whole sats, never a Double. */
     private var amountSats: Long = 0L
     private var enteredAmountSats: Long = 0L
+
+    /**
+     * #612: set by tapping the available total, cleared by any edit of the
+     * amount and by an account change. While set, compose spends every
+     * spendable coin it is given to one output and ignores [amountSats].
+     */
+    private var spendAll = false
+
+    /**
+     * #612: what a spend-all actually sends (the coins' total minus the
+     * miner fee), so the BTC field can show it. Null when the last compose
+     * was not a spend-all or did not succeed.
+     */
+    private val _spendAllSentSats = MutableLiveData<Long?>(null)
+    val spendAllSentSats: LiveData<Long?> = _spendAllSentSats
     var job: Job? = null
     private var selectedFee = 0L
 
@@ -225,6 +241,10 @@ class SendViewModel : ViewModel() {
         clearReviewedPsbt()
         // #190: a pin belongs to the account it was made against.
         _pinnedOutpoints.value = emptySet()
+        // #612: "spend all" was a tap on the other account's total. The
+        // figure that tap put in the field stays as a typed amount.
+        spendAll = false
+        _spendAllSentSats.value = null
         _pinnedTotal.value = null
         // #190: each account switch used to add another observer and leave
         // the previous account's attached, so its next emission replaced the
@@ -294,19 +314,23 @@ class SendViewModel : ViewModel() {
         }
 
         amountSats = enteredAmountSats
+        val spendAll = this.spendAll
 
-        if (amountSats <= 0L) {
+        if (!spendAll && amountSats <= 0L) {
             return block(SpendBlocker.NO_AMOUNT)
         }
 
         if (utxos.isEmpty()) {
             return block(SpendBlocker.NO_FUNDS)
         }
+        if (spendAll && spendableSats() <= 0L) {
+            return block(SpendBlocker.NO_FUNDS)
+        }
         // Checked before composing so "more than you hold" is distinguishable
         // from a compose that failed for any other reason. The fee is not
         // known yet, so this does not catch an amount that only fails once the
         // fee is added; compose() still reports that as CANNOT_COMPOSE.
-        if (amountSats > spendableSats()) {
+        if (!spendAll && amountSats > spendableSats()) {
             return block(SpendBlocker.INSUFFICIENT_FUNDS)
         }
         if (feeInvalid) {
@@ -321,7 +345,7 @@ class SendViewModel : ViewModel() {
             is CoinSelection.Resolution.Blocked -> return block(SpendBlocker.SELECTION_BLOCKED)
             is CoinSelection.Resolution.Missing -> return block(SpendBlocker.SELECTION_MISSING)
             is CoinSelection.Resolution.Pinned -> {
-                if (amountSats > selection.totalSats) {
+                if (!spendAll && amountSats > selection.totalSats) {
                     return block(SpendBlocker.SELECTION_INSUFFICIENT)
                 }
                 selection.utxos
@@ -348,10 +372,13 @@ class SendViewModel : ViewModel() {
                             utxosSelectableForSend(explicitInputs ?: utxos)
                                 .filter { utxo -> !UtxoMetaUtil.has(utxo) }
                         ),
-                        explicitSelection = explicitInputs != null
+                        explicitSelection = explicitInputs != null,
+                        spendAll = spendAll
                     )
+                    val sent = transactionComposer.getComposedAmountSats()
                     withContext(Dispatchers.Main) {
                         if (generation != spendGeneration) return@withContext
+                        _spendAllSentSats.value = if (isValid && spendAll) sent else null
                         _validSpend.postValue(isValid)
                         _spendBlocker.postValue(
                             if (isValid) SpendBlocker.NONE else SpendBlocker.CANNOT_COMPOSE
@@ -422,8 +449,25 @@ class SendViewModel : ViewModel() {
      */
     fun setAmountSats(sats: Long) {
         enteredAmountSats = sats
+        spendAll = false
+        _spendAllSentSats.value = null
         prepareSpend()
     }
+
+    /**
+     * #612: the available total was tapped. Compose spends every spendable
+     * coin (do-not-spend excluded, the pinned set while coins are pinned)
+     * to one output, whatever [displayedSats] says. [displayedSats] is kept
+     * as the typed amount if spend-all is later dropped by an account change.
+     */
+    fun setSpendAll(displayedSats: Long) {
+        enteredAmountSats = displayedSats
+        spendAll = true
+        _spendAllSentSats.value = null
+        prepareSpend()
+    }
+
+    internal fun isSpendAll(): Boolean = spendAll
 
     private val utxoObserver: Observer<List<Utxo>> = Observer { raw ->
         applySelectableUtxos(raw)
@@ -435,7 +479,8 @@ class SendViewModel : ViewModel() {
         applySelectableUtxos(lastRawUtxos)
     }
 
-    private fun applySelectableUtxos(raw: List<Utxo>) {
+    @VisibleForTesting
+    internal fun applySelectableUtxos(raw: List<Utxo>) {
         lastRawUtxos = raw
         val hidden = hiddenXpubCount(raw)
         _unsyncedXpubNote.value = unsyncedXpubNote(hidden)

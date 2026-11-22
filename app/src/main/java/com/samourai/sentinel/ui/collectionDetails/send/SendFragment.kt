@@ -289,6 +289,17 @@ class SendFragment : Fragment() {
             }
         }
 
+        // #612: a spend-all sends the coins' total minus the miner fee.
+        // setBtcEdit does not count as an edit, so spend-all stays on.
+        viewModel.spendAllSentSats.observe(viewLifecycleOwner) { sent ->
+            if (sent == null || _fragmentSpendBinding == null || !viewModel.isSpendAll()) {
+                return@observe
+            }
+            amountSats = sent
+            setBtcEdit(SatsAmount.formatBtc(sent))
+            setFiatFor(sent)
+        }
+
         viewModel.minerFee.observe(viewLifecycleOwner) {
             fragmentSpendBinding.fragmentComposeTx.feeSelector.totalMinerFee.text = it
         }
@@ -779,10 +790,15 @@ class SendFragment : Fragment() {
         setFiatEdit(DecimalFormat.getNumberInstance().format(fiatRate))
     }
 
-    /** Tapping the available total: the BTC field gets that figure, exactly. */
+    /**
+     * #612: tapping the available total is "spend all", not "type this
+     * figure". Compose spends every spendable coin to one output, so a
+     * figure that lags the coins cannot break it. The field shows the
+     * figure until compose reports what is actually sent.
+     */
     private fun spendAvailable() {
         amountSats = availableBalance
-        viewModel.setAmountSats(availableBalance)
+        viewModel.setSpendAll(availableBalance)
         setBtcEdit(SatsAmount.formatBtc(availableBalance))
         setFiatFor(availableBalance)
     }

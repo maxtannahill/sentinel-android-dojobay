@@ -18,7 +18,9 @@ import com.samourai.sentinel.ui.utils.PrefsUtil
 import com.samourai.wallet.segwit.SegwitAddress
 import com.samourai.wallet.segwit.bech32.Bech32UtilGeneric
 import com.samourai.wallet.util.XPUB
+import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import okhttp3.mockwebserver.Dispatcher
@@ -113,6 +115,82 @@ class SpendAllComposeTest {
         assertTrue(tx.outputs.any { it.value.value == 29_000_000L })
     }
 
+    @Test
+    fun spendAllSpendsACoinTheFigureMissedInsteadOfFailingOnDust() {
+        // The figure reads 0.19506493 BTC, but a 700-sat coin is already in
+        // the pool. As an amount, that left change under dust and failed.
+        val coins = listOf(
+            wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1), wallet.funded(700L, 2)
+        )
+        val failed = composeFailure(coins, 19_506_493L)
+        assertTrue(failed is TransactionComposer.ComposeException)
+        val composer = composer()
+        val tx = compose(coins, 19_506_493L, spendAll = true, composer = composer)
+        assertEquals(3, tx.inputs.size)
+        assertEquals(1, tx.outputs.size)
+        assertEquals(19_507_193L - feeFor(tx, coins), tx.outputs[0].value.value)
+        assertEquals(tx.outputs[0].value.value, composer.getComposedAmountSats())
+    }
+
+    @Test
+    fun spendAllLeavesNoChangeWhenTheFigureLagsTheCoinsByMoreThanDust() {
+        val coins = listOf(
+            wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1), wallet.funded(50_000L, 2)
+        )
+        // As an amount, the stale figure composes but leaves a change output.
+        assertEquals(2, compose(coins, 19_506_493L).outputs.size)
+        val tx = compose(coins, 19_506_493L, spendAll = true)
+        assertEquals(3, tx.inputs.size)
+        assertEquals(1, tx.outputs.size)
+    }
+
+    @Test
+    fun spendAllIgnoresAFigureAboveTheCoins() {
+        val coins = listOf(wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1))
+        val tx = compose(coins, 25_000_000L, spendAll = true)
+        assertEquals(2, tx.inputs.size)
+        assertEquals(1, tx.outputs.size)
+        assertEquals(19_506_493L - feeFor(tx, coins), tx.outputs[0].value.value)
+    }
+
+    @Test
+    fun spendAllOfPinnedCoinsSpendsExactlyThoseCoins() {
+        val pinned = listOf(wallet.funded(3_000_000L, 0), wallet.funded(2_000_000L, 1))
+        val tx = compose(pinned, 1L, explicit = true, spendAll = true)
+        assertEquals(2, tx.inputs.size)
+        assertEquals(1, tx.outputs.size)
+        assertEquals(5_000_000L - feeFor(tx, pinned), tx.outputs[0].value.value)
+    }
+
+    @Test
+    fun spendAllOfCoinsThatCannotPayTheFeeIsRefused() {
+        val coins = listOf(wallet.funded(600L, 0))
+        val failed = composeFailure(coins, 600L, spendAll = true)
+        assertTrue(failed is TransactionComposer.ComposeException)
+    }
+
+    @Test
+    fun tappingTheTotalComposesAMaxSendThroughTheViewModel() {
+        val coins = listOf(
+            wallet.funded(12_000_000L, 0), wallet.funded(7_506_493L, 1), wallet.funded(700L, 2)
+        )
+        val vm = viewModel(coins)
+        vm.setSpendAll(19_506_493L)
+        vm.settle()
+        assertTrue(vm.isSpendAll())
+        assertEquals(true, vm.validSpend.value)
+        assertEquals(SendViewModel.SpendBlocker.NONE, vm.spendBlocker.value)
+        val sent = vm.spendAllSentSats.value!!
+        assertTrue(sent in 19_500_000L until 19_507_193L)
+
+        // Typing an amount is no longer a spend-all.
+        vm.setAmountSats(10_000_000L)
+        vm.settle()
+        assertTrue(!vm.isSpendAll())
+        assertEquals(null, vm.spendAllSentSats.value)
+        assertEquals(true, vm.validSpend.value)
+    }
+
     // Fixture
 
     private fun composer() = TransactionComposer().apply { setPubKey(listOf(wallet.pub)) }
@@ -121,6 +199,7 @@ class SpendAllComposeTest {
         utxos: List<FundedUtxo>,
         amountSats: Long,
         explicit: Boolean = false,
+        spendAll: Boolean = false,
         composer: TransactionComposer = composer(),
     ): Transaction {
         val bytes = runBlocking {
@@ -132,6 +211,7 @@ class SpendAllComposeTest {
                     inputFee = 1000L,
                     inputAmountSats = amountSats,
                     explicitSelection = explicit,
+                    spendAll = spendAll,
                 )
                 assertTrue(ok)
                 fee.await()
@@ -144,6 +224,7 @@ class SpendAllComposeTest {
     private fun composeFailure(
         utxos: List<FundedUtxo>,
         amountSats: Long,
+        spendAll: Boolean = false,
         composer: TransactionComposer = composer(),
     ): Exception = runBlocking {
         withTimeout(20_000) {
@@ -154,6 +235,7 @@ class SpendAllComposeTest {
                     inputAddress = wallet.externalAddress,
                     inputFee = 1000L,
                     inputAmountSats = amountSats,
+                    spendAll = spendAll,
                 )
                 fail("expected compose to fail")
                 throw IllegalStateException()
@@ -164,6 +246,36 @@ class SpendAllComposeTest {
                 fee.cancel()
             }
         }
+    }
+
+    /** A Send ViewModel on [coins], with the composer bound to the test wallet. */
+    private fun viewModel(
+        coins: List<FundedUtxo>,
+        composer: TransactionComposer = composer(),
+    ): SendViewModel {
+        val vm = SendViewModel()
+        SendViewModel::class.java.getDeclaredField("transactionComposer").apply {
+            isAccessible = true
+            set(vm, composer)
+        }
+        // The ViewModel drains the fee channel of the composer it built.
+        vm.viewModelScope.launch { for (ignored in composer.getMinerFee()) Unit }
+        vm.setDestinationAddress(wallet.externalAddress)
+        vm.applySelectableUtxos(coins.map { it.utxo })
+        vm.settle()
+        return vm
+    }
+
+    /** Runs the compose job and the main-thread verdict it posts. */
+    private fun SendViewModel.settle() {
+        val looper = shadowOf(Looper.getMainLooper())
+        val deadline = System.currentTimeMillis() + 20_000
+        while (job?.isActive == true) {
+            check(System.currentTimeMillis() < deadline) { "compose did not finish" }
+            looper.idle()
+            Thread.sleep(5)
+        }
+        repeat(3) { looper.idle() }
     }
 
     private fun feeFor(tx: Transaction, coins: List<FundedUtxo>): Long =

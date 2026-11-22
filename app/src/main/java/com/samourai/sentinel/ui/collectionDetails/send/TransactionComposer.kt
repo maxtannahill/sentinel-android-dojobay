@@ -82,6 +82,16 @@ class TransactionComposer {
         return minerFeeChannel
     }
 
+    /**
+     * #612: the payment output of the last compose that succeeded, in
+     * sats. For a spend-all this is the coins' total minus the fee. Null
+     * until a compose succeeds, and from the start of each compose.
+     */
+    @Volatile
+    private var composedAmountSats: Long? = null
+
+    fun getComposedAmountSats(): Long? = composedAmountSats
+
     fun setPubKey(selectPubKeyModel: List<PubKeyModel>) {
         this.selectPubKeyModel = selectPubKeyModel
     }
@@ -100,13 +110,21 @@ class TransactionComposer {
      * #612: [inputAmountSats] is whole sats. It used to be a Double that
      * the screen had divided by 1e8 and multiplied back, which could land
      * one sat low and then miss the spend-all branch below.
+     *
+     * #612: [spendAll] is the user tapping the available total. Every coin
+     * in [inputUtxos] is spent to one output of their sum minus the
+     * one-output fee, with no change. [inputAmountSats] is ignored then,
+     * so a figure that lags the coins cannot turn a max send into a dust
+     * failure or a send that quietly leaves change. Read the amount that
+     * was actually sent from [getComposedAmountSats].
      */
     suspend fun compose(
         inputUtxos: ArrayList<Utxo>,
         inputAddress: String,
         inputFee: Long,
         inputAmountSats: Long,
-        explicitSelection: Boolean = false
+        explicitSelection: Boolean = false,
+        spendAll: Boolean = false
     ): Boolean {
         composeMutex.withLock {
             if (selectPubKeyModel == null) {
@@ -115,6 +133,7 @@ class TransactionComposer {
             receivers = hashMapOf()
             selectedUtxos = arrayListOf()
             balance = 0L
+            composedAmountSats = null
             amount = inputAmountSats
             address = inputAddress
             selectedFee = inputFee
@@ -147,6 +166,20 @@ class TransactionComposer {
             // sort in ascending order by value
             Collections.sort(utxos, UTXO.UTXOComparator())
             utxos.reverse()
+            if (spendAll) {
+                // #612: the amount is whatever these coins hold. The
+                // max-send branch below then takes the one-output fee off it.
+                if (utxos.isEmpty()) {
+                    throw ComposeException("No coins to spend")
+                }
+                amount = utxos.sumOf { it.value }
+                if (!explicitSelection) {
+                    for (u in utxos) {
+                        selectedUtxos.add(u)
+                        totalValueSelected += u.value
+                    }
+                }
+            }
             receivers[address] = BigInteger.valueOf(amount)
             if (explicitSelection) {
                 // #190: the pinned set is the selection. No threshold loops.
@@ -163,7 +196,7 @@ class TransactionComposer {
             }
             // get smallest 1 UTXO > than spend + fee + dust
             for (u in utxos) {
-                if (explicitSelection) break
+                if (explicitSelection || spendAll) break
                 val outpointTypes: Triple<Int, Int, Int> =
                     FeeUtil.getInstance().getOutpointCount(Vector(u.outpoints))
                 if (u.value >= amount + bDust.toLong() + FeeUtil.getInstance().estimatedFeeSegwit(
@@ -184,7 +217,7 @@ class TransactionComposer {
                 }
             }
 
-            if (selectedUtxos.size == 0 && !explicitSelection) {
+            if (selectedUtxos.size == 0 && !explicitSelection && !spendAll) {
                 // sort in descending order by value
                 Collections.sort(utxos, UTXO.UTXOComparator())
                 var selected = 0
@@ -219,7 +252,7 @@ class TransactionComposer {
             // #190: this pre-fee check is skipped for a pinned set - a set
             // that covers the amount but not the fee would read as "dust"
             // here. The post-fee checks below cover both outcomes.
-            if (!explicitSelection && change > 0L && change < bDust.toLong()) {
+            if (!explicitSelection && !spendAll && change > 0L && change < bDust.toLong()) {
                 throw ComposeException("Change is dust 1")
             }
 
@@ -240,7 +273,7 @@ class TransactionComposer {
                 outpointTypes.right,
                 2
             )
-            if (amount == balance) {
+            if (spendAll || amount == balance) {
                 fee = FeeUtil.getInstance().estimatedFeeSegwit(
                     outpointTypes.left,
                     outpointTypes.middle,
@@ -248,6 +281,9 @@ class TransactionComposer {
                     1
                 )
                 amount -= fee.toLong()
+                if (amount < bDust.toLong()) {
+                    throw ComposeException("Amount after fee is dust")
+                }
                 receivers.clear()
                 receivers[address] = BigInteger.valueOf(amount)
 
@@ -484,6 +520,7 @@ class TransactionComposer {
                 }
             }
 
+            composedAmountSats = amount
             return true
         }
     }

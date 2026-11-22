@@ -69,7 +69,7 @@ class PsbtFileExportSourceTest {
 
         val setPub = vm.substringAfter("fun setPublicKey(").substringBefore("private fun getPubKeyModelByLabel")
         assertTrue(setPub.contains("clearReviewedPsbt()"))
-        val apply = vm.substringAfter("private fun applySelectableUtxos")
+        val apply = vm.substringAfter("internal fun applySelectableUtxos")
             .substringBefore("fun setDestinationAddress")
         assertTrue(apply.contains("noteReviewedInputs(raw) { UtxoMetaUtil.has(it) }"))
         assertTrue(apply.contains("prepareSpend()"))
