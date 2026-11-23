@@ -2,8 +2,10 @@ package com.samourai.sentinel.api
 
 import android.app.Application
 import android.os.Looper
+import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.MutableLiveData
 import androidx.test.core.app.ApplicationProvider
+import com.samourai.sentinel.R
 import com.samourai.sentinel.core.SentinelState
 import com.samourai.sentinel.data.AddressTypes
 import com.samourai.sentinel.data.PubKeyModel
@@ -16,6 +18,7 @@ import com.samourai.sentinel.ui.dojo.DojoPairing
 import com.samourai.sentinel.ui.dojo.DojoUtility
 import com.samourai.sentinel.ui.dojo.PubKeyRescanner
 import com.samourai.sentinel.ui.utils.PrefsUtil
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import okhttp3.Headers
 import okhttp3.Protocol
@@ -31,6 +34,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -40,9 +44,11 @@ import org.koin.core.context.startKoin
 import org.koin.core.context.stopKoin
 import org.koin.dsl.module
 import org.koin.java.KoinJavaComponent
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowDialog
 import timber.log.Timber
 import java.net.InetAddress
 import java.net.Proxy
@@ -118,6 +124,8 @@ class RescanExpiredTokenTest {
         prefs.testnet = false
         if (this::api.isInitialized) {
             api.beforeNewCall = null
+            api.afterCall = null
+            api.onResponseClosed = null
             runCatching { api.client.connectionPool.evictAll() }
         }
         shadowOf(Looper.getMainLooper()).idle()
@@ -127,6 +135,8 @@ class RescanExpiredTokenTest {
     fun tearDown() {
         if (this::api.isInitialized) {
             api.beforeNewCall = null
+            api.afterCall = null
+            api.onResponseClosed = null
             runCatching { api.client.connectionPool.evictAll() }
         }
         restorePairingGate()
@@ -138,10 +148,20 @@ class RescanExpiredTokenTest {
     @Test
     fun `isExpiredDojoJwt matches Dojo's 401 envelope and nothing else`() {
         assertTrue(api.isExpiredDojoJwt(http(401, DOJO_EXPIRED)))
+        assertTrue(api.isExpiredDojoJwt(http(401, """{ "status" : "error", "error" : "Invalid JSON Web Token" }""")))
         assertFalse(api.isExpiredDojoJwt(http(401, """{"status":"error","error":"Missing JSON Web Token"}""")))
         assertFalse(api.isExpiredDojoJwt(http(403, DOJO_EXPIRED)))
         assertFalse(api.isExpiredDojoJwt(http(200, """{"status":"ok"}""")))
         assertFalse(api.isExpiredDojoJwt(http(500, """{"status":"error","error":{"status":"Server error"}}""")))
+        assertFalse(api.isExpiredDojoJwt(http(401, """{"status":"ok","error":"Invalid JSON Web Token"}""")))
+        assertFalse(api.isExpiredDojoJwt(http(401, "<html>Invalid JSON Web Token</html>")))
+        assertFalse(api.isExpiredDojoJwt(http(401, """{"status":"error","error":"Invalid JSON Web Token","extra":1}""")))
+        try {
+            assertFalse(api.isExpiredDojoJwt(http(401, "{")))
+            assertFalse(api.isExpiredDojoJwt(http(401, "not-json Invalid JSON Web Token")))
+        } catch (t: Throwable) {
+            fail("a malformed 401 body must not throw, got ${t.javaClass.simpleName}")
+        }
     }
 
     @Test
@@ -309,6 +329,155 @@ class RescanExpiredTokenTest {
         assertEquals(0, authCount())
     }
 
+
+    @Test
+    fun `a cancelled refresh is rethrown and does not return the stale 401`() = withPairedDojo {
+        seedExpiredToken()
+        serveAuthThen { req ->
+            if (isXpub(req)) expired()
+            else error("unexpected ${req.path}")
+        }
+        api.beforeNewCall = { _, request ->
+            if (request.url.encodedPath.contains("/auth/")) {
+                throw CancellationException("test cancellation")
+            }
+        }
+        try {
+            runBlocking { api.rescanPubKey(XPUB, AddressTypes.BIP84) }.close()
+            fail("expected CancellationException")
+        } catch (_: CancellationException) {
+        }
+        assertEquals(1, xpubCount())
+        assertEquals(0, authCount())
+    }
+
+    @Test
+    fun `a cancelled refresh before the key loop is rethrown and later keys are not scanned`() = withPairedDojo {
+        seedExpiredToken()
+        serveAuthThen { req ->
+            if (isXpub(req)) ok()
+            else error("unexpected ${req.path}")
+        }
+        api.beforeNewCall = { _, request ->
+            if (request.url.encodedPath.contains("/auth/")) {
+                throw CancellationException("test cancellation")
+            }
+        }
+        try {
+            runBlocking { PubKeyRescanner.rescanKeys(SIX_KEYS) }
+            fail("expected CancellationException")
+        } catch (_: CancellationException) {
+        }
+        assertEquals(0, xpubCount())
+    }
+
+    @Test
+    fun `a cancelled key is rethrown and later keys are not scanned`() = withPairedDojo {
+        seedExpiredToken()
+        serveAuthThen { req ->
+            if (isXpub(req)) ok()
+            else error("unexpected ${req.path}")
+        }
+        var xpubCalls = 0
+        api.beforeNewCall = { _, request ->
+            val path = request.url.encodedPath
+            if (path == "/xpub" || path.endsWith("/xpub")) {
+                xpubCalls++
+                if (xpubCalls == 2) throw CancellationException("test cancellation")
+            }
+        }
+        try {
+            runBlocking { PubKeyRescanner.rescanKeys(SIX_KEYS) }
+            fail("expected CancellationException")
+        } catch (_: CancellationException) {
+        }
+        assertEquals(1, xpubCount())
+    }
+
+    @Test
+    fun `the progress dialog is dismissed when a CancellationException is thrown`() = withPairedDojo {
+        seedExpiredToken()
+        serveAuthThen { error("the call must be cancelled before it is sent") }
+        api.beforeNewCall = { _, _ -> throw CancellationException("test cancellation") }
+        val activity = rescanActivity()
+        PubKeyRescanner.rescan(activity, SIX_KEYS.take(1), emptyList(), 0, 0L)
+        waitUntil { !dialogShowing() }
+        assertFalse(dialogShowing())
+    }
+
+    @Test
+    fun `the progress dialog is dismissed when ApiNotConfigured is thrown`() = withPairedDojo {
+        seedExpiredToken()
+        serveAuthThen { error("ApiNotConfigured must be thrown before the call is sent") }
+        api.beforeNewCall = { _, _ -> throw ApiService.ApiNotConfigured() }
+        val activity = rescanActivity()
+        PubKeyRescanner.rescan(activity, SIX_KEYS.take(1), emptyList(), 0, 0L)
+        waitUntil { !dialogShowing() }
+        assertFalse(dialogShowing())
+    }
+
+    @Test
+    fun `an expired-looking 401 after an off-origin redirect does not refresh or resend`() = withPairedDojo {
+        seedExpiredToken()
+        val offHits = CopyOnWriteArrayList<String>()
+        val off = MockWebServer()
+        off.start(InetAddress.getByName("127.0.0.1"), 0)
+        try {
+            off.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    offHits += request.path ?: ""
+                    return expired()
+                }
+            }
+            server.dispatcher = recording { req ->
+                when {
+                    req.path.orEmpty().startsWith("/auth/") ->
+                        // 500 rather than error(): on the unfixed path a
+                        // thrown dispatcher leaves the client waiting until
+                        // the Tor read timeout.
+                        MockResponse().setResponseCode(500).setBody("refresh-must-not-run")
+                    isXpub(req) ->
+                        MockResponse()
+                            .setResponseCode(302)
+                            .setHeader("Location", off.url("/xpub").toString())
+                    else -> error("unexpected ${req.path}")
+                }
+            }
+            val response = runBlocking { api.rescanPubKey(XPUB, AddressTypes.BIP84) }
+            try {
+                assertEquals(401, response.code)
+            } finally {
+                response.close()
+            }
+            assertEquals(0, authCount())
+            assertEquals(1, xpubCount())
+            assertEquals(1, offHits.size)
+            val secrets = listOf(STALE, FRESH, REFRESH, API_KEY, "at=")
+            assertTrue(offHits.none { line -> secrets.any { it in line } })
+        } finally {
+            off.shutdown()
+        }
+    }
+
+    @Test
+    fun `the first response is closed when the call is resent`() = withPairedDojo {
+        seedExpiredToken()
+        serveAuthThen { req ->
+            if (isXpub(req) && hasFresh(req)) ok()
+            else if (isXpub(req)) expired()
+            else error("unexpected ${req.path}")
+        }
+        val observed = mutableListOf<Int>()
+        val closed = mutableListOf<Int>()
+        api.afterCall = { observed += it.code }
+        api.onResponseClosed = { closed += it.code }
+        runBlocking { api.rescanPubKey(XPUB, AddressTypes.BIP84) }.close()
+        assertTrue("the first 401 must have been observed", 401 in observed)
+        assertTrue("first.close() must have closed the first 401 body", 401 in closed)
+        assertEquals(1, authCount())
+        assertEquals(2, xpubCount())
+    }
+
     //
     // Harness
     //
@@ -359,6 +528,25 @@ class RescanExpiredTokenTest {
     private fun authCount() = seen.count {
         it.path.substringBefore("?").endsWith("/auth/refresh") ||
             it.path.substringBefore("?").endsWith("/auth/login")
+    }
+
+    private fun rescanActivity(): AppCompatActivity {
+        val controller = Robolectric.buildActivity(AppCompatActivity::class.java)
+        controller.get().setTheme(R.style.AppThemeV3)
+        return controller.setup().get()
+    }
+
+    private fun dialogShowing(): Boolean =
+        ShadowDialog.getShownDialogs().any { it.isShowing }
+
+    private fun waitUntil(timeoutMs: Long = 8_000, condition: () -> Boolean) {
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
+        while (System.nanoTime() < deadline) {
+            shadowOf(Looper.getMainLooper()).idle()
+            if (condition()) return
+            Thread.sleep(20)
+        }
+        fail("timed out")
     }
 
     private fun http(code: Int, body: String): Response = Response.Builder()
