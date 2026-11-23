@@ -134,6 +134,11 @@ class SendViewModel : ViewModel() {
          */
         PREV_TX_UNVERIFIED,
         /**
+         * #612: no Dojo is paired (ApiService.ApiNotConfigured). Trying again
+         * cannot succeed until a Dojo is paired, so the screen shows no Retry.
+         */
+        NO_DOJO,
+        /**
          * #612: the Dojo could not be reached, or would not serve the
          * previous transactions (a login the refresh could not renew, a
          * server error). The screen offers Retry.
@@ -466,10 +471,10 @@ class SendViewModel : ViewModel() {
                     // throw would have escaped the compose job from the send screen. Same
                     // degrade as :132-136. FQN deliberate: this file has no ApiService
                     // import; simple-name cleanup may follow.
-                    // #612: reported as Dojo unreachable, with Retry.
+                    // #612: no Dojo is paired, so Retry cannot succeed.
                     Timber.e(e, "Compose aborted: no API endpoint configured")
                     viewModelScope.launch(Dispatchers.Main) {
-                        if (generation == spendGeneration) block(SpendBlocker.DOJO_UNREACHABLE)
+                        if (generation == spendGeneration) block(SpendBlocker.NO_DOJO)
                     }
                 } catch (e: Exception) {
                     viewModelScope.launch(Dispatchers.Main) {

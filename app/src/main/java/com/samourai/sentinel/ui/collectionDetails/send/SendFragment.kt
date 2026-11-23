@@ -67,6 +67,7 @@ import kotlinx.coroutines.withContext
 import org.bouncycastle.util.encoders.Hex
 import org.koin.java.KoinJavaComponent.inject
 import timber.log.Timber
+import java.math.BigDecimal
 import java.math.BigInteger
 import java.text.DecimalFormat
 import java.util.*
@@ -652,6 +653,8 @@ class SendFragment : Fragment() {
             return
         }
         val status = when (blocker) {
+            SendViewModel.SpendBlocker.NO_DOJO ->
+                getString(R.string.send_error_no_dojo)
             SendViewModel.SpendBlocker.DOJO_UNREACHABLE ->
                 getString(R.string.send_error_dojo_unreachable)
             SendViewModel.SpendBlocker.PREV_TX_UNVERIFIED ->
@@ -777,8 +780,14 @@ class SendFragment : Fragment() {
 
     private fun watchAddressAndAmount() {
         fragmentSpendBinding.fiatEditTextLayout.hint = exchangeRateRepository.getRateLive().value?.currency
-        fragmentSpendBinding.fiatEditText.addTextChangedListener { onFiatValueChange(it.toString()) }
-        fragmentSpendBinding.btcEditText.addTextChangedListener { onBtcValueChanged(it.toString()) }
+        fragmentSpendBinding.fiatEditText.addTextChangedListener {
+            val text = cappedEditableText(it)
+            onFiatValueChange(text)
+        }
+        fragmentSpendBinding.btcEditText.addTextChangedListener {
+            val text = cappedEditableText(it)
+            onBtcValueChanged(text)
+        }
         fragmentSpendBinding.btcAddress.addTextChangedListener {
             if (it.toString().isNotEmpty()) {
                 address = it.toString().trim()
@@ -795,49 +804,67 @@ class SendFragment : Fragment() {
         }
     }
 
+    private fun cappedEditableText(editable: CharSequence?): String {
+        if (editable == null) return ""
+        return if (editable.length > SatsAmount.MAX_INPUT_LENGTH) {
+            editable.subSequence(0, SatsAmount.MAX_INPUT_LENGTH + 1).toString()
+        } else {
+            editable.toString()
+        }
+    }
+
+    private fun clearEnteredAmount(clearBtcField: Boolean, clearFiatField: Boolean = true) {
+        if (clearBtcField) setBtcEdit("")
+        if (clearFiatField) setFiatEdit("")
+        amountSats = 0L
+        viewModel.setAmountSats(0L)
+    }
+
     private fun onBtcValueChanged(btcString: String) {
         if (isBTCEditing) {
             return
         }
         try {
-            if (btcString.isEmpty()) {
-                setBtcEdit("")
-                setFiatEdit("")
-                // #612: an emptied field is no amount, not the last one typed.
-                amountSats = 0L
-                viewModel.setAmountSats(0L)
+            if (btcString.length > SatsAmount.MAX_INPUT_LENGTH) {
+                clearEnteredAmount(clearBtcField = true)
                 return
             }
-            if (btcString.split(".").size > 1 && btcString.split(".")[1].length > 8) {
-                setBtcEdit(btcString.dropLast(btcString.split(".")[1].length-8))
+            if (btcString.isEmpty()) {
+                setBtcEdit("")
+                // #612: an emptied field is no amount, not the last one typed.
+                clearEnteredAmount(clearBtcField = false)
                 return
+            }
+            val parts = btcString.split(".")
+            val effectiveBtc = if (parts.size == 2 && parts[1].length > 8) {
+                (parts[0] + "." + parts[1].take(8)).also { setBtcEdit(it) }
+            } else {
+                btcString
             }
             // #612: exact decimal to sats. toDouble() then * 1e8 built
             // 28,999,999 sats for 0.29.
-            val sats = SatsAmount.parseBtc(btcString)
+            val sats = SatsAmount.parseBtc(effectiveBtc)
             if (sats == null) {
-                if (btcString.toDoubleOrNull()?.let { it > 21000000.0 } == true) {
-                    setFiatEdit("")
-                    setBtcEdit("")
-                }
+                val overMax = effectiveBtc.trim().toBigDecimalOrNull()
+                    ?.let { it > BigDecimal.valueOf(21_000_000L) } == true
+                clearEnteredAmount(clearBtcField = overMax)
+                return
+            }
+            if (sats <= 0L) {
+                clearEnteredAmount(clearBtcField = false)
                 return
             }
             amountSats = sats
-            if (amountSats <= 0L) {
-                fragmentSpendBinding.composeBtn.alpha = 0.6f
-                fragmentSpendBinding.composeBtn.isEnabled = false
-                return
-            }
             setFiatFor(amountSats)
             viewModel.setAmountSats(amountSats)
         } catch (Ex: Exception) {
-
+            clearEnteredAmount(clearBtcField = false)
         }
     }
 
     /** The fiat field for [sats]. Display only; the amount stays in sats. */
     private fun setFiatFor(sats: Long) {
-        val fiatRate = SatsAmount.toBtc(sats).toDouble().times(rate.rate)
+        val fiatRate = SatsAmount.satsToFiat(sats, rate.rate)
         setFiatEdit(DecimalFormat.getNumberInstance().format(fiatRate))
     }
 
@@ -855,42 +882,50 @@ class SendFragment : Fragment() {
     }
 
     private fun onFiatValueChange(fiatString: String) {
-        val ungroupedFiat = fiatString.replace((DecimalFormat.getInstance() as DecimalFormat).decimalFormatSymbols.groupingSeparator.toString(), "")
         if (isFiatEditing) {
             return
         }
-        if (ungroupedFiat.contains(".") && ungroupedFiat.split(".")[1].length > 2) {
-            setFiatEdit(ungroupedFiat.dropLast(1))
+        if (fiatString.length > SatsAmount.MAX_INPUT_LENGTH) {
+            clearEnteredAmount(clearBtcField = true, clearFiatField = true)
             return
         }
+        val grouping = (DecimalFormat.getInstance() as DecimalFormat)
+            .decimalFormatSymbols.groupingSeparator.toString()
+        val ungroupedFiat = fiatString.replace(grouping, "")
         try {
             if (ungroupedFiat.isEmpty()) {
-                setBtcEdit("")
-                setFiatEdit("")
-                fragmentSpendBinding.composeBtn.alpha = 0.6f
-                fragmentSpendBinding.composeBtn.isEnabled = false
+                clearEnteredAmount(clearBtcField = true, clearFiatField = true)
+                return
             }
-            val fiat: Double = ungroupedFiat.toDouble()
-            val btcRate = (1 / rate.rate.toFloat()) * fiat.toFloat()
-            if (btcRate > 21000000.0) {
-                setBtcEdit("")
-                setFiatEdit("")
+            val parts = ungroupedFiat.split(".")
+            val effectiveFiat = if (parts.size == 2 && parts[1].length > 2) {
+                (parts[0] + "." + parts[1].take(2)).also { setFiatEdit(it) }
+            } else {
+                ungroupedFiat
+            }
+            val fiat = SatsAmount.parseFiat(effectiveFiat)
+            if (fiat == null) {
+                clearEnteredAmount(clearBtcField = true, clearFiatField = false)
+                return
+            }
+            val sats = SatsAmount.fiatToSats(effectiveFiat, rate.rate)
+            if (sats == null) {
+                clearEnteredAmount(clearBtcField = true, clearFiatField = true)
                 return
             }
 
-            if (ungroupedFiat.get(ungroupedFiat.lastIndex).equals('.'))
+            if (effectiveFiat.endsWith('.'))
                 setFiatEdit(DecimalFormat.getNumberInstance().format(fiat) + ".")
             else
                 setFiatEdit(DecimalFormat.getNumberInstance().format(fiat))
 
-            // #612: the sats this fiat figure converts to are the amount.
-            // Parsing the formatted BTC text back as a Double could move it.
-            val sats = (btcRate * 1e8).toLong()
+            // #612: the sats this fiat figure converts to are the amount,
+            // computed via BigDecimal without Float rounding loss.
             setBtcEdit(MonetaryUtil.getInstance().formatToBtc(sats))
             amountSats = sats
             viewModel.setAmountSats(amountSats)
         } catch (Ex: Exception) {
-
+            clearEnteredAmount(clearBtcField = true, clearFiatField = false)
         }
     }
 

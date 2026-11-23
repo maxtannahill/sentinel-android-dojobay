@@ -79,6 +79,7 @@ class SpendAllComposeTest {
         FeeUtil.getInstance().suggestedFee = suggested
         wallet = Wallet(SentinelState.getNetworkParam()!!)
         mode = Mode.SERVE
+        oneShotResponse = null
         hexRequests.set(0)
         authRequests.set(0)
     }
@@ -449,6 +450,88 @@ class SpendAllComposeTest {
         assertTrue(!vm.canClearPinnedSelection)
     }
 
+
+    @Test
+    fun noPairedDojoReportsNoDojoInsteadOfUnreachableWithNoRetry() {
+        val coins = listOf(wallet.funded(12_000_000L, 0))
+        val savedEndpoint = prefs.apiEndPoint
+        val savedTorEndpoint = prefs.apiEndPointTor
+        try {
+            prefs.apiEndPoint = null
+            prefs.apiEndPointTor = null
+            val vm = viewModel(coins)
+            vm.setAmountSats(5_000_000L)
+            vm.settle()
+            assertEquals(SendViewModel.SpendBlocker.NO_DOJO, vm.spendBlocker.value)
+            assertEquals(false, vm.spendBlocker.value!!.canRetry)
+            assertEquals(false, vm.validSpend.value)
+            assertEquals(
+                "No Dojo paired. Pair a Dojo in Settings",
+                ApplicationProvider.getApplicationContext<Application>()
+                    .getString(R.string.send_error_no_dojo),
+            )
+        } finally {
+            prefs.apiEndPoint = savedEndpoint
+            prefs.apiEndPointTor = savedTorEndpoint
+        }
+    }
+
+    @Test
+    fun prevTxHexIsRejectedAndNotCachedBeforeHashCheckPasses() {
+        val coin = wallet.funded(12_000_000L, 0)
+        val wrongTx = wallet.funded(12_000_000L, 1)
+        val composer = composer()
+
+        // First compose receives valid hex for a DIFFERENT transaction (wrong txid hash).
+        oneShotResponse = MockResponse().setBody("""{"status":"ok","data":"${wrongTx.hex}"}""")
+        val wrongHashFailure = composeFailure(listOf(coin), 5_000_000L, composer = composer)
+        assertTrue(wrongHashFailure is TransactionComposer.PrevTxException)
+        assertTrue(!(wrongHashFailure as TransactionComposer.PrevTxException).dojoUnreachable)
+        assertEquals(1, hexRequests.getAndSet(0))
+
+        // Second compose with malformed hex also fails and is not cached.
+        oneShotResponse = MockResponse().setBody("""{"status":"ok","data":"deadbeef"}""")
+        val malformedFailure = composeFailure(listOf(coin), 5_000_000L, composer = composer)
+        assertTrue(malformedFailure is TransactionComposer.PrevTxException)
+        assertEquals(1, hexRequests.getAndSet(0))
+
+        // Third compose with the honest server MUST re-fetch (neither bad hex was cached) and succeed.
+        val tx = compose(listOf(coin), 5_000_000L, composer = composer)
+        assertEquals(1, tx.inputs.size)
+        assertEquals(1, hexRequests.get())
+    }
+
+    @Test
+    fun prevTxCacheEvictsEldestEntryAtThe500Cap() {
+        assertEquals(500, TransactionComposer.PREV_TX_CACHE_MAX)
+        val coins = (0..500).map { wallet.funded(1_000_000L, it) }
+        val composer = composer()
+
+        // Insert entry 0 first so it is strictly the eldest entry in the FIFO cache,
+        // then fill the remaining 499 slots across batches.
+        compose(listOf(coins[0]), 100_000L, composer = composer)
+        compose(coins.subList(1, 50), 100_000L, explicit = true, spendAll = true, composer = composer)
+        for (start in 50 until 500 step 50) {
+            val batch = coins.subList(start, start + 50)
+            compose(batch, 100_000L, explicit = true, spendAll = true, composer = composer)
+        }
+        assertEquals(500, hexRequests.getAndSet(0))
+
+        // Confirm entry 0 is currently cached (and FIFO order is unchanged).
+        compose(listOf(coins[0]), 100_000L, composer = composer)
+        assertEquals("entry 0 should be cached before overflow", 0, hexRequests.getAndSet(0))
+
+        // Adding the 501st entry evicts entry 0 (FIFO), while a newer entry stays cached.
+        compose(listOf(coins[500]), 100_000L, composer = composer)
+        assertEquals(1, hexRequests.getAndSet(0))
+
+        compose(listOf(coins[499]), 100_000L, composer = composer)
+        assertEquals("newer entry 499 should still be cached", 0, hexRequests.getAndSet(0))
+
+        compose(listOf(coins[0]), 100_000L, composer = composer)
+        assertEquals("entry 0 should have been evicted at the 500 cap", 1, hexRequests.get())
+    }
+
     // Fixture
 
     private fun composer() = TransactionComposer().apply { setPubKey(listOf(wallet.pub)) }
@@ -671,6 +754,8 @@ class SpendAllComposeTest {
         @Volatile
         internal var mode = Mode.SERVE
         @Volatile
+        internal var oneShotResponse: MockResponse? = null
+        @Volatile
         private var refreshed = false
         val hexRequests = AtomicInteger()
         val authRequests = AtomicInteger()
@@ -694,6 +779,10 @@ class SpendAllComposeTest {
                         return MockResponse().setBody(FRESH_AUTH)
                     }
                     hexRequests.incrementAndGet()
+                    oneShotResponse?.let { override ->
+                        oneShotResponse = null
+                        return override
+                    }
                     when (mode) {
                         Mode.SERVE -> Unit
                         Mode.EXPIRED_UNTIL_REFRESH -> if (!refreshed) {

@@ -3,7 +3,9 @@ package com.samourai.sentinel.ui.collectionDetails.send
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.math.BigDecimal
 
 /**
  * #612: the Send amount is parsed to whole sats from the BTC text, with
@@ -65,5 +67,37 @@ class SatsAmountTest {
             assertEquals(sats, SatsAmount.parseBtc(SatsAmount.formatBtc(sats)))
         }
         assertNotEquals(29_000_000L, ("0.29".toDouble() * 1e8).toLong())
+    }
+
+    @Test
+    fun oversizedInputIsRejectedImmediatelyWithoutHanging() {
+        val huge = "1".repeat(1_000_000)
+        val startNs = System.nanoTime()
+        assertNull(SatsAmount.parseBtc(huge))
+        assertNull(SatsAmount.parseFiat(huge))
+        assertNull(SatsAmount.fiatToSats(huge, 100_000L))
+        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+        assertTrue("expected immediate rejection, took ${elapsedMs}ms", elapsedMs < 200L)
+
+        // Leading zeros or decimals over MAX_INPUT_LENGTH (32) are also rejected,
+        // while 21000000.00000000 (17 chars) stays well within the limit.
+        assertNull(SatsAmount.parseBtc("0".repeat(SatsAmount.MAX_INPUT_LENGTH) + "1"))
+        assertEquals(SatsAmount.MAX_SATS, SatsAmount.parseBtc("21000000.00000000"))
+    }
+
+    @Test
+    fun fiatConversionUsesBigDecimalWithoutFloatPrecisionLoss() {
+        // $999 at $99,900/BTC is exact 0.01 BTC = 1,000,000 sats.
+        // Float ((1f / 99_900f) * 999f * 1e8).toLong() loses a sat (999,999).
+        assertEquals(999_999L, ((1f / 99_900f) * 999f * 1e8).toLong())
+        assertEquals(1_000_000L, SatsAmount.fiatToSats("999", 99_900L))
+        assertEquals(1_000_000L, SatsAmount.fiatToSats("999.00", 99_900L))
+
+        assertEquals(0, BigDecimal("999.00").compareTo(SatsAmount.satsToFiat(1_000_000L, 99_900L)))
+        assertEquals(BigDecimal.ZERO, SatsAmount.satsToFiat(1_000_000L, 0L))
+        assertNull(SatsAmount.fiatToSats("100", 0L))
+        assertNull(SatsAmount.fiatToSats("100", -1L))
+        assertNull(SatsAmount.fiatToSats(".", 100_000L))
+        assertNull(SatsAmount.fiatToSats("2100000000001", 100_000L))
     }
 }

@@ -573,6 +573,7 @@
     <!-- Prev-tx verification fails closed. The sentence does not name the input. -->
     <string name="send_error_prev_tx_unverified" translatable="false">Unable to verify the previous transaction</string>
     <!-- #612: the Dojo did not answer the prev-tx fetch. Shown above COMPOSE with Retry. -->
+    <string name="send_error_no_dojo" translatable="false">No Dojo paired. Pair a Dojo in Settings</string>
     <string name="send_error_dojo_unreachable" translatable="false">Could not reach Dojo</string>
     <string name="send_retry" translatable="false">Retry</string>
     <!-- #612: shown above COMPOSE UNSIGNED TRANSACTION while compose checks each input's previous transaction with the Dojo. -->
