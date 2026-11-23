@@ -74,6 +74,21 @@ open class ApiService {
      */
     @Volatile
     internal var beforeNewCall: ((OkHttpClient, Request) -> Unit)? = null
+    /**
+     * Observes each [callOn] response after the socket has been released.
+     * The expired-token retry test uses this to check that the first
+     * response is closed before the resend. Null in production.
+     */
+    @Volatile
+    internal var afterCall: ((Response) -> Unit)? = null
+    /**
+     * Called when a [callOn] response body is closed. The in-memory
+     * body [Call.await] returns is a Buffer, whose close is a no-op
+     * on isOpen, so the expired-token retry test uses this hook.
+     * Null in production.
+     */
+    @Volatile
+    internal var onResponseClosed: ((Response) -> Unit)? = null
     private val  JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     private val HARDENED = 2147483648
 
@@ -124,7 +139,8 @@ open class ApiService {
         val sentTo = runCatching { getAPIUrl() }.getOrNull()
         val dojoCall = isDojoCall(sentTo, request)
         return try {
-            val response = captured.newCall(request).await(maxBodyBytes = maxBodyBytes)
+            val response = notifyWhenClosed(captured.newCall(request).await(maxBodyBytes = maxBodyBytes))
+            afterCall?.invoke(response)
             if (dojoCall) {
                 noteDojoResponse(response)
                 noteDojoVersion(response, sentTo, sentGeneration)
@@ -146,6 +162,28 @@ open class ApiService {
             if (dojoCall) DojoReachability.recordTransport(e)
             throw e
         }
+    }
+
+    /**
+     * Wraps [response] so [onResponseClosed] runs when the body is
+     * closed. No-op when the hook is null.
+     */
+    private fun notifyWhenClosed(response: Response): Response {
+        val hook = onResponseClosed ?: return response
+        val original = response.body ?: return response
+        val wrapped = object : okhttp3.ResponseBody() {
+            override fun contentType() = original.contentType()
+            override fun contentLength() = original.contentLength()
+            override fun source() = original.source()
+            override fun close() {
+                try {
+                    original.close()
+                } finally {
+                    hook(response)
+                }
+            }
+        }
+        return response.newBuilder().body(wrapped).build()
     }
 
     /**
@@ -287,6 +325,8 @@ open class ApiService {
                     return true
                 }
                 Timber.w("Dojo /auth/refresh rejected (code ${response.code}); trying API key")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Timber.w(e, "Dojo /auth/refresh failed; trying API key")
             }
@@ -309,6 +349,8 @@ open class ApiService {
             }
             Timber.e("Dojo /auth/login rejected (code ${response.code})")
             return false
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             Timber.e(e, "Dojo /auth/login failed")
             return false
@@ -364,8 +406,12 @@ open class ApiService {
     ): Response {
         val first = callOn(captured, request, maxBodyBytes)
         if (!isExpiredDojoJwt(first)) return first
+        val configured = runCatching { getAPIUrl() }.getOrNull()
+        if (!TokenAuthenticator.isDojoTarget(configured, first.request.url)) return first
         val refreshed = try {
             refreshDojoAuth()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             Timber.w("Dojo login refresh failed (%s)", e.javaClass.simpleName)
             false
@@ -383,7 +429,24 @@ open class ApiService {
         } catch (_: Exception) {
             return false
         }
-        return body.contains(DOJO_INVALID_JWT)
+        return isDojoInvalidJwtBody(body)
+    }
+
+    /**
+     * True when [body] parses as exactly
+     * `{"status":"error","error":"Invalid JSON Web Token"}`.
+     * A malformed body, an HTML 401, or any other JSON shape is false
+     * and does not throw.
+     */
+    internal fun isDojoInvalidJwtBody(body: String): Boolean {
+        val json = try {
+            SafeJson.parseObject(body)
+        } catch (_: Exception) {
+            return false
+        }
+        return json.length() == 2 &&
+            json.opt("status") == "error" &&
+            json.opt("error") == DOJO_INVALID_JWT
     }
 
     suspend fun checkImportStatus(pubKey: String) = withContext(Dispatchers.IO) {
@@ -534,7 +597,7 @@ open class ApiService {
             .post(formBody)
             .build()
 
-        return callOnRetryingExpiredJwt(http, request)
+        return callOnRetryingExpiredJwt(http, request, maxBodyBytes = SafeJson.SMALL_BODY_MAX_BYTES)
     }
 
 
@@ -726,10 +789,10 @@ open class ApiService {
         /** Head of a Dojo body, enough to see `"status":"error"` and nothing else. */
         private const val DOJO_STATUS_PEEK_BYTES = 80L
 
-        /** Tor SOCKS handshake. A dead onion fails here, once. */
         /** Dojo errors.auth.INVALID_JWT (lib/errors.ts). */
         internal const val DOJO_INVALID_JWT = "Invalid JSON Web Token"
 
+        /** Tor SOCKS handshake. A dead onion fails here, once. */
         internal const val TOR_CONNECT_SECONDS = 45L
 
         /** After the circuit exists, a slow Dojo may still be writing. */
