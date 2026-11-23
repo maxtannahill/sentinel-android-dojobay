@@ -70,7 +70,7 @@ class CommunityDojoTorOffTest {
         SentinelTorManager.onManualStart = {
             startCount++
             if (SentinelTorManager.getTorState().state == EnumTorState.OFF) {
-                setTor(EnumTorState.STARTING, 0, proxy = false)
+                SentinelTorManager.publish(EnumTorState.STARTING, 0)
             }
         }
         startKoin {
@@ -129,9 +129,9 @@ class CommunityDojoTorOffTest {
         waitUntil("off state") { torOff(list).visibility == View.VISIBLE }
         // Retry and the banner Retry both call connectTorThenFetch, which
         // must not start Tor while the setting is off.
-        CommunityDojoListBottomSheet::class.java.getDeclaredMethod("connectTorThenFetch")
+        CommunityDojoListBottomSheet::class.java.getDeclaredMethod("connectTorThenFetch", Boolean::class.javaPrimitiveType)
             .apply { isAccessible = true }
-            .invoke(list)
+            .invoke(list, true)
         idle()
         waitUntil("still off") { torOff(list).visibility == View.VISIBLE }
 

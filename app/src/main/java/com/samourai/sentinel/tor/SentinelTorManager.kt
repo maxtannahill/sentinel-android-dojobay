@@ -379,7 +379,7 @@ object SentinelTorManager {
             this.progressIndicator = progress
         }
 
-    private fun publish(state: EnumTorState, progress: Int) {
+    internal fun publish(state: EnumTorState, progress: Int) {
         if (progress > 0 || state == EnumTorState.ON) {
             lastBootstrapProgressAt = SystemClock.elapsedRealtime()
         }

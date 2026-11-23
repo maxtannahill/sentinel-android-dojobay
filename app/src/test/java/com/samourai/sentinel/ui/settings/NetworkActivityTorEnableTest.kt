@@ -65,7 +65,7 @@ class NetworkActivityTorEnableTest {
         SentinelTorManager.onManualStart = {
             startCount++
             if (SentinelTorManager.getTorState().state == EnumTorState.OFF) {
-                setTor(EnumTorState.STARTING, 0, proxy = false)
+                SentinelTorManager.publish(EnumTorState.STARTING, 0)
             }
         }
         KeyRegistrationBurst.markFinished()

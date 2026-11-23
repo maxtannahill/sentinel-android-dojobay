@@ -85,7 +85,7 @@ class DojoConnectTorOffTest {
         SentinelTorManager.onManualStart = {
             startCount++
             if (SentinelTorManager.getTorState().state == EnumTorState.OFF) {
-                setTor(EnumTorState.STARTING, 0, proxy = null)
+                SentinelTorManager.publish(EnumTorState.STARTING, 0)
             }
         }
         startKoin {
@@ -249,17 +249,17 @@ class DojoConnectTorOffTest {
             assertEquals(View.GONE, steps(page).visibility)
             assertEquals(1, startCount)
 
-            // Tapping Turn on Tor again starts Tor once and finishes the connect.
+            // Tapping Turn on Tor again starts Tor once and brings Tor up,
+            // but does not auto-submit pairing because pairingConfirmedWaitingForTor was reset.
             enableTor(page).performClick()
             idle()
             assertEquals(2, startCount)
             assertEquals(true, prefs.enableTor)
-            waitUntil("login request sent after second Turn on Tor") {
-                server.loginRequests == 1 &&
-                    ShadowDialog.getLatestDialog().let { it is AlertDialog && it.isShowing && it !== dialog }
+            waitUntil("Tor checkmark visible without auto-login") {
+                page.requireView().findViewById<View>(R.id.checkImageTor).visibility == View.VISIBLE
             }
-            (ShadowDialog.getLatestDialog() as AlertDialog).dismiss()
-            idle()
+            assertEquals(0, server.loginRequests)
+            assertFalse(GlobalContext.get().get<DojoUtility>().isDojoEnabled())
         } finally {
             server.close()
         }

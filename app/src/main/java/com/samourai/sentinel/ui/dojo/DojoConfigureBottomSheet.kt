@@ -812,6 +812,7 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
                         removeTurnOnTorObserver()
                         waitingForTurnOnTorReady = false
                         if (prefsUtil.enableTor != true) {
+                            pairingConfirmedWaitingForTor = false
                             torProgressShown = false
                             torSuccessShown = false
                             dojoProgressShown = false

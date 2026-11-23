@@ -291,10 +291,11 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
     private fun turnOnTorAndFetch() {
         if (!isAdded) return
         // Same path as the Settings toggle: set the pref and start().
-        // setUp() is already done by the Application (and connectTorThenFetch
-        // will call it if a wait is still needed).
+        // TorRouting.enable just started Tor; publish() uses postValue so
+        // getTorState() can still read OFF on this frame — tell
+        // connectTorThenFetch not to call start() a second time.
         TorRouting.enable(prefsUtil)
-        connectTorThenFetch()
+        connectTorThenFetch(startIfOff = false)
     }
 
     /** Status and button for when the user's Tor Routing setting is off. */
@@ -325,7 +326,7 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
      * and Tor is not already on, show the off state and do not start
      * Tor or fetch. STARTING with the setting off is treated as off.
      */
-    private fun connectTorThenFetch() {
+    private fun connectTorThenFetch(startIfOff: Boolean = true) {
         if (fetchInFlight) return
         if (!TorRouting.directoryMayUseTor(prefsUtil)) {
             showTorRoutingOff()
@@ -358,7 +359,7 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
         // would reset the proxy and watchdog mid-bootstrap. STARTING
         // or ON-but-not-ready just waits. setUp is only needed on
         // that same OFF path (it is already done if Tor is running).
-        if (SentinelTorManager.getTorState().state == EnumTorState.OFF) {
+        if (startIfOff && SentinelTorManager.getTorState().state == EnumTorState.OFF) {
             SentinelTorManager.setUp(requireContext().applicationContext as Application)
             // #170: directory-fetch start, no stomp on the user's toggle.
             SentinelTorManager.start()
