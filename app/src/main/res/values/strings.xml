@@ -230,6 +230,7 @@
     <string name="community_dojo_turn_on_tor" translatable="false">Turn on Tor</string>
     <string name="community_dojo_tor_off_title" translatable="false">Tor is not connected</string>
     <string name="community_dojo_tor_off_body" translatable="false">Dojo Bay\'s directory is only reachable over Tor. Turn on Tor Routing to load the list.</string>
+    <string name="dojo_connect_tor_off_body" translatable="false">Dojo is only reachable over Tor. Turn on Tor Routing to connect.</string>
     <string name="community_dojo_status_dot_description" translatable="false">Dojo online status</string>
     <!-- Dojo Bay unreachable: the last list fetched is kept and shown with
          its date, and the directory address can be changed. -->

@@ -39,8 +39,11 @@ import com.samourai.sentinel.databinding.FragmentBottomsheetViewPagerBinding
 import com.samourai.sentinel.helpers.SafeJson
 import com.samourai.sentinel.helpers.fromJSON
 import com.samourai.sentinel.helpers.readUtf8Capped
+import androidx.lifecycle.Observer
 import com.samourai.sentinel.tor.EnumTorState
 import com.samourai.sentinel.tor.SentinelTorManager
+import com.samourai.sentinel.tor.TorRouting
+import com.samourai.sentinel.tor.TorState
 import com.samourai.sentinel.ui.utils.AndroidUtil
 import com.samourai.sentinel.ui.utils.PermissionResult
 import com.samourai.sentinel.ui.utils.PrefsUtil
@@ -483,6 +486,11 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
     // state change, for the whole pairing POST on warm Tor (#260).
     // Every show*() site below latches state and re-renders; the
     // render no longer depends on who wins the view-creation race.
+    private var torOffShown = false
+    private var waitingForTurnOnTorReady = false
+    private var pairingConfirmedWaitingForTor = false
+    private var torTurnOnJob: Job? = null
+    private var torTurnOnObserver: Observer<TorState>? = null
     private var torProgressShown = false
     private var torSuccessShown = false
     private var dojoProgressShown = false
@@ -541,6 +549,9 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
         // puts that window back on Disable Screenshots and does not
         // touch the host activity.
         releasePairingScanWindow()
+        torTurnOnJob?.cancel()
+        torTurnOnJob = null
+        removeTurnOnTorObserver()
         // #231: the page-selected callback dies with the pager's view.
         pagerCallback?.let { binding.pager.unregisterOnPageChangeCallback(it) }
         pagerCallback = null
@@ -694,6 +705,15 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
      */
     private fun renderConnectPageState() {
         val page = connectPage() ?: return
+        if (torOffShown) {
+            page.showTorOff()
+            return
+        }
+        page.hideTorOff()
+        if (!torProgressShown && !torSuccessShown && !dojoProgressShown && !dojoSuccessShown) {
+            page.resetProgress()
+            return
+        }
         if (torProgressShown) page.showTorProgress()
         if (torSuccessShown) page.showTorProgressSuccess()
         if (dojoProgressShown) page.showDojoProgress()
@@ -705,12 +725,15 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
      * dialog opens BEFORE any network contact - the Dojo never learns
      * the attempt existed until the user taps Pair. Tor bootstrap is
      * not Dojo contact (circuit building touches the Tor network,
-     * never the node), so the daemon still starts at selection: the
-     * bootstrap overlaps the user reading the dialog, and the #260
-     * latch renders the Tor spinner behind it across the
-     * view-creation race. The observer below is indicator-only - the
-     * POST start lives behind the Pair tap now, so the old handoff
-     * latch (torHandoffDone) died with the arm it guarded.
+     * never the node), so the daemon still starts at selection when Tor
+     * Routing is on (or for a manual scan/paste): the bootstrap
+     * overlaps the user reading the dialog, and the #260 latch renders
+     * the Tor spinner behind it across the view-creation race.
+     *
+     * When a cached Community Dojos listing is tapped while Tor Routing
+     * is off (and Tor is not already ON), Tor must not start here: the
+     * connect page latches the Turn on Tor step instead, and Tor starts
+     * only if the user taps Turn on Tor.
      */
     private fun startTorAndPresentPairing() {
         if (pairingAckGate.onPairingSelected() == PairingAckDecision.SHOW_CONFIRMATION) {
@@ -719,9 +742,16 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
         if (SentinelTorManager.getTorState().state == EnumTorState.ON) {
             // #260: latched, not single-shot - the tor checkmark
             // renders even if the page's view is still mid-creation.
+            torOffShown = false
             torSuccessShown = true
             renderConnectPageState()
+        } else if (pickedFromList && !TorRouting.directoryMayUseTor(prefsUtil)) {
+            torOffShown = true
+            torProgressShown = false
+            torSuccessShown = false
+            renderConnectPageState()
         } else {
+            torOffShown = false
             setUpTor()
             // #170: pairing start, no stomp on the user's toggle.
             SentinelTorManager.start()
@@ -729,7 +759,7 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
             torProgressShown = true
             renderConnectPageState()
             SentinelTorManager.getTorStateLiveData().observe(this) {
-                if (it.state == EnumTorState.ON) {
+                if (it.state == EnumTorState.ON && !torOffShown) {
                     // #261: indicator-only. The old observer gated
                     // setDo() on the checkmark rendering - a Tor-ON
                     // landing inside the view-creation window dropped
@@ -743,6 +773,91 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
                 }
             }
         }
+    }
+
+    /**
+     * Connect page: TURN ON TOR tapped. Uses the same TorRouting.enable
+     * path as Settings and Community Dojos (starts Tor once), waits for
+     * Tor readiness, re-checks that Tor Routing is still on, and then
+     * continues the pairing if Pair was already confirmed.
+     */
+    fun onTurnOnTorClicked() {
+        if (!isAdded || !torOffShown) return
+        torOffShown = false
+        waitingForTurnOnTorReady = true
+        torProgressShown = true
+        torSuccessShown = false
+        renderConnectPageState()
+        TorRouting.enable(prefsUtil)
+        observeTurnOnTorReady()
+    }
+
+    private fun removeTurnOnTorObserver() {
+        torTurnOnObserver?.let { SentinelTorManager.getTorStateLiveData().removeObserver(it) }
+        torTurnOnObserver = null
+    }
+
+    private fun observeTurnOnTorReady() {
+        removeTurnOnTorObserver()
+        torTurnOnJob?.cancel()
+        var sawStart = false
+        val observer = Observer<TorState> { state ->
+            sawStart = CommunityDojoTorWait.sawStart(state.state, sawStart)
+            when (CommunityDojoTorWait.onState(state.state, sawStart)) {
+                CommunityDojoTorWait.Action.FETCH_WHEN_READY -> {
+                    if (torTurnOnJob?.isActive == true) return@Observer
+                    torTurnOnJob = lifecycleScope.launch {
+                        val ready = SentinelTorManager.awaitTorReady(TOR_READY_TIMEOUT_MS)
+                        if (!isAdded) return@launch
+                        removeTurnOnTorObserver()
+                        waitingForTurnOnTorReady = false
+                        if (prefsUtil.enableTor != true) {
+                            torProgressShown = false
+                            torSuccessShown = false
+                            dojoProgressShown = false
+                            torOffShown = true
+                            renderConnectPageState()
+                            return@launch
+                        }
+                        if (!ready) {
+                            if (pairingConfirmedWaitingForTor) {
+                                pairingConfirmedWaitingForTor = false
+                                dismissAllOrToast(false)
+                            } else {
+                                torProgressShown = false
+                                torOffShown = true
+                                renderConnectPageState()
+                            }
+                            return@launch
+                        }
+                        torSuccessShown = true
+                        renderConnectPageState()
+                        if (pairingConfirmedWaitingForTor) {
+                            pairingConfirmedWaitingForTor = false
+                            dojoProgressShown = true
+                            renderConnectPageState()
+                            setDojo()
+                        }
+                    }
+                }
+                CommunityDojoTorWait.Action.FAIL -> {
+                    removeTurnOnTorObserver()
+                    torTurnOnJob?.cancel()
+                    waitingForTurnOnTorReady = false
+                    if (pairingConfirmedWaitingForTor) {
+                        pairingConfirmedWaitingForTor = false
+                        dismissAllOrToast(false)
+                    } else {
+                        torProgressShown = false
+                        torOffShown = true
+                        renderConnectPageState()
+                    }
+                }
+                CommunityDojoTorWait.Action.WAIT -> Unit
+            }
+        }
+        torTurnOnObserver = observer
+        SentinelTorManager.getTorStateLiveData().observe(this, observer)
     }
 
     /**
@@ -1095,6 +1210,10 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
         if (pairingAckGate.onUserConfirmed() != PairingAckDecision.START_CONNECT) return
         // Pair: the list has done its job; the connect page shows the progress.
         if (pickedFromList) communityDojoList()?.dismiss()
+        if (torOffShown || waitingForTurnOnTorReady) {
+            pairingConfirmedWaitingForTor = true
+            return
+        }
         dojoProgressShown = true
         renderConnectPageState()
         setDojo()
@@ -1313,8 +1432,19 @@ class DojoConfigureBottomSheet : GenericBottomSheet() {
         payload = ""
         pickedFromList = false
         connectStarted = false
+        torOffShown = false
+        waitingForTurnOnTorReady = false
+        pairingConfirmedWaitingForTor = false
+        torTurnOnJob?.cancel()
+        torTurnOnJob = null
+        removeTurnOnTorObserver()
+        torProgressShown = false
+        torSuccessShown = false
+        dojoProgressShown = false
+        dojoSuccessShown = false
         pairingAckGate.rearmAfterDecline()
         binding.pager.setCurrentItem(0, false)
+        renderConnectPageState()
     }
 
     private fun setUpTor() {
@@ -1449,6 +1579,9 @@ class DojoNodeInstructions : Fragment() {
 class DojoConnectFragment : Fragment() {
 
 
+    private lateinit var stepsContainer: View
+    private lateinit var torOff: View
+    private lateinit var enableTorButton: MaterialButton
     private lateinit var checkImageTor: ImageView
     private lateinit var checkImageDojo: ImageView
     private lateinit var progressTor: ProgressBar
@@ -1463,6 +1596,9 @@ class DojoConnectFragment : Fragment() {
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View? {
         val view = inflater.inflate(R.layout.bottomsheet_dojo_connection, container, false)
+        stepsContainer = view.findViewById(R.id.dojoConnectSteps)
+        torOff = view.findViewById(R.id.dojoConnectTorOff)
+        enableTorButton = view.findViewById(R.id.dojoConnectEnableTor)
         progressTor = view.findViewById(R.id.progressTor)
         checkImageTor = view.findViewById(R.id.checkImageTor)
 
@@ -1474,7 +1610,30 @@ class DojoConnectFragment : Fragment() {
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        enableTorButton.setOnClickListener {
+            (parentFragment as? DojoConfigureBottomSheet)?.onTurnOnTorClicked()
+        }
         (parentFragment as? DojoConfigureBottomSheet)?.onConnectViewReady()
+    }
+
+    fun showTorOff() {
+        if (view == null) return
+        stepsContainer.visibility = View.GONE
+        torOff.visibility = View.VISIBLE
+    }
+
+    fun hideTorOff() {
+        if (view == null) return
+        torOff.visibility = View.GONE
+        stepsContainer.visibility = View.VISIBLE
+    }
+
+    fun resetProgress() {
+        if (view == null) return
+        progressTor.visibility = View.INVISIBLE
+        checkImageTor.visibility = View.INVISIBLE
+        progressDojo.visibility = View.INVISIBLE
+        checkImageDojo.visibility = View.INVISIBLE
     }
 
     fun showTorProgress() {
