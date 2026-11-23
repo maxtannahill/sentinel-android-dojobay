@@ -416,12 +416,70 @@ class SettingsPinGateTest {
         enterGatePin(settings, RIGHT_PIN)
         waitUntil("overlay dismisses after cancellation") { !kdfOverlayVisible() }
         assertTrue(gatePadVisible(settings))
+        assertFalse(pinUnavailableShown(settings))
+        assertFalse(incorrectPinShown(settings))
         assertFalse(exportChooserVisible(settings))
 
         // Busy latch was cleared in finally, so a second attempt can run.
         enterGatePin(settings, RIGHT_PIN)
         waitUntil("export options appear after cancellation clears busy") { exportChooserVisible(settings) }
         assertEquals(2, calls.get())
+    }
+
+    @Test
+    fun `dismissing the pad mid-check prevents the gated action even after a right PIN`() {
+        storePinInVault()
+        val settings = openSettings()
+        val fragment = settingsFragment(settings)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        fragment.gatePinVerifier = { _ ->
+            entered.countDown()
+            assertTrue("verifier latch timed out", release.await(10, TimeUnit.SECONDS))
+            UnlockResult.Success
+        }
+
+        clickPref(settings, "export")
+        assertTrue(gatePadVisible(settings))
+        val pad = gatePad(settings)!!
+
+        enterGatePin(settings, RIGHT_PIN)
+        assertTrue("verifier did not start", entered.await(5, TimeUnit.SECONDS))
+
+        // Dismiss the pad in code while the background check is still running.
+        pad.dismiss()
+        idle()
+        assertFalse(gatePadVisible(settings))
+
+        release.countDown()
+        idle()
+        waitUntil("overlay dismisses after check finishes") { !kdfOverlayVisible() }
+        assertFalse("gated action must not run after pad dismissal", exportChooserVisible(settings))
+    }
+
+    @Test
+    fun `legacy pinHash is ignored once PinVault material exists`() {
+        storePinInVault()
+        // Plant a matching legacy hash for WRONG_PIN alongside valid PinVault material for RIGHT_PIN.
+        val digest = MessageDigest.getInstance("SHA-256")
+        prefs.pinHash = Hash(digest.digest(WRONG_PIN.toByteArray(StandardCharsets.UTF_8))).toString()
+        val vault = PinVault(PrefsPinMaterialStore(prefs), access, NoAtRestSealer)
+
+        assertEquals(UnlockResult.WrongPin, vault.verify(WRONG_PIN))
+        assertEquals(UnlockResult.Success, vault.verify(RIGHT_PIN))
+
+        val settings = openSettings()
+        clickPref(settings, "export")
+        enterGatePin(settings, WRONG_PIN)
+        waitUntil("incorrect PIN is shown when PinVault rejects legacy hash PIN") { incorrectPinShown(settings) }
+        assertFalse(exportChooserVisible(settings))
+
+        enterGatePin(settings, RIGHT_PIN)
+        waitUntil("export opens for the PinVault PIN") { exportChooserVisible(settings) }
+
+        // Corrupt PinVault material must still return Unavailable rather than falling back to pinHash.
+        prefs.pinKeyMaterial = "not-valid-json"
+        assertTrue(vault.verify(WRONG_PIN) is UnlockResult.Unavailable)
     }
 
     private fun storePinInVault() {

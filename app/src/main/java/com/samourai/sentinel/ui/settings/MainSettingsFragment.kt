@@ -669,6 +669,11 @@ class MainSettingsFragment : PreferenceFragmentCompat() {
                 gateBusy = false
             }
             if (!isAdded) return@launch
+            val current = parentFragmentManager.findFragmentByTag(TAG_PIN_GATE) as? LockScreenDialog
+            if (current !== dialog || !dialog.isAdded || dialog.view == null || dialog.isRemoving) {
+                pendingGatedAction = null
+                return@launch
+            }
             when (result) {
                 UnlockResult.Success -> {
                     // Consume the authorisation before running, so a replayed
