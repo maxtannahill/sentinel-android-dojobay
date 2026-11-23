@@ -43,7 +43,7 @@ class TorRoutingTest {
     }
 
     @Test
-    fun `the list may use Tor when the setting is on, or when Tor is already on or starting`() {
+    fun `the list may use Tor when the setting is on, or when Tor is already on`() {
         assertFalse(TorRouting.directoryMayUseTor(prefs))
 
         prefs.enableTor = true
@@ -51,6 +51,14 @@ class TorRoutingTest {
 
         prefs.enableTor = false
         setTor(EnumTorState.STARTING, 5, proxy = false)
+        assertFalse(TorRouting.directoryMayUseTor(prefs))
+
+        prefs.enableTor = true
+        setTor(EnumTorState.STARTING, 5, proxy = false)
+        assertTrue(TorRouting.directoryMayUseTor(prefs))
+
+        prefs.enableTor = false
+        setTor(EnumTorState.ON, 50, proxy = false)
         assertTrue(TorRouting.directoryMayUseTor(prefs))
 
         setTor(EnumTorState.ON, 100, proxy = true)

@@ -17,13 +17,15 @@ object TorRouting {
 
     /**
      * The Community Dojos list may start or wait for Tor when the user
-     * has Tor Routing on, or when Tor is already on or still starting
-     * because they enabled it. Otherwise the list must not start Tor.
+     * has Tor Routing on, or when Tor is already on. STARTING only
+     * counts when the setting is on — that is the "still starting
+     * because they enabled it" case, including Turn on Tor, which sets
+     * the pref and then sees STARTING. A STARTING daemon with routing
+     * off does not pass the gate, and must not be restarted.
      */
     fun directoryMayUseTor(prefs: PrefsUtil): Boolean {
         if (prefs.enableTor == true) return true
         if (SentinelTorManager.isTorReady()) return true
-        val state = SentinelTorManager.getTorState().state
-        return state == EnumTorState.ON || state == EnumTorState.STARTING
+        return SentinelTorManager.getTorState().state == EnumTorState.ON
     }
 }

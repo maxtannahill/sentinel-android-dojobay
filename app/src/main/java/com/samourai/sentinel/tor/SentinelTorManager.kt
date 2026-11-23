@@ -182,8 +182,16 @@ object SentinelTorManager {
         }
     }
 
+    /**
+     * Observes each user-directed [start]. The Community Dojos tests
+     * use this to count Turn on Tor starts. Null in production.
+     */
+    @Volatile
+    internal var onManualStart: (() -> Unit)? = null
+
     /** Public entry: user-directed start. Resets the retry budget + episode state. */
     fun start() {
+        onManualStart?.invoke()
         Timber.i("start() (manual)")
         recoveries = 0
         cheapRestartUsed = false

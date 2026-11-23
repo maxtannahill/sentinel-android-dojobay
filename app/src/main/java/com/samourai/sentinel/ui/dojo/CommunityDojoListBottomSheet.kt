@@ -24,6 +24,7 @@ import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.snackbar.Snackbar
 import com.google.android.material.button.MaterialButton
 import com.samourai.sentinel.R
+import com.samourai.sentinel.tor.EnumTorState
 import com.samourai.sentinel.tor.SentinelTorManager
 import com.samourai.sentinel.tor.TorRouting
 import com.samourai.sentinel.ui.utils.PrefsUtil
@@ -321,8 +322,8 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
 
     /**
      * Retry and the banner Retry share this entry. If Tor Routing is off
-     * and Tor is not already on or starting, show the off state and do
-     * not start Tor or fetch.
+     * and Tor is not already on, show the off state and do not start
+     * Tor or fetch. STARTING with the setting off is treated as off.
      */
     private fun connectTorThenFetch() {
         if (fetchInFlight) return
@@ -347,9 +348,21 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
         // OFF for a few seconds after start(), which is not a failure
         // (CommunityDojoTorWait).
         showLoading(getString(R.string.community_dojo_waiting_tor), waitingForTor = true)
-        SentinelTorManager.setUp(requireContext().applicationContext as Application)
-        // #170: directory-fetch start, no stomp on the user's toggle.
-        SentinelTorManager.start()
+        // Captured at the start of this wait: if the user then turns
+        // routing off while Tor stays ON, the pending fetch is dropped.
+        // Opening with routing already off and Tor already on still
+        // follows today's path.
+        val routingWasOn = prefsUtil.enableTor == true
+        // Only start when Tor is OFF. Turn on Tor has just called
+        // start() through TorRouting.enable; a second start() here
+        // would reset the proxy and watchdog mid-bootstrap. STARTING
+        // or ON-but-not-ready just waits. setUp is only needed on
+        // that same OFF path (it is already done if Tor is running).
+        if (SentinelTorManager.getTorState().state == EnumTorState.OFF) {
+            SentinelTorManager.setUp(requireContext().applicationContext as Application)
+            // #170: directory-fetch start, no stomp on the user's toggle.
+            SentinelTorManager.start()
+        }
         var sawStart = false
         val liveData = SentinelTorManager.getTorStateLiveData()
         // One observer per sheet: a Retry must not stack another one.
@@ -393,12 +406,15 @@ class CommunityDojoListBottomSheet() : GenericBottomSheet() {
                     viewLifecycleOwner.lifecycleScope.launch {
                         if (SentinelTorManager.awaitTorReady()) {
                             torWaitJob?.cancel()
-                            if (!fetchInFlight && isAdded) {
-                                // Back to the loading state in case the
-                                // wait limit already showed the failure.
-                                showLoading(getString(R.string.community_dojo_connecting_tor))
-                                fetchDirectory()
+                            if (!isAdded || fetchInFlight) return@launch
+                            if (routingWasOn && prefsUtil.enableTor != true) {
+                                showTorRoutingOff()
+                                return@launch
                             }
+                            // Back to the loading state in case the
+                            // wait limit already showed the failure.
+                            showLoading(getString(R.string.community_dojo_connecting_tor))
+                            fetchDirectory()
                         }
                     }
                 }
