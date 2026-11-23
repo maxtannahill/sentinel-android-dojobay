@@ -17,7 +17,9 @@ import com.samourai.sentinel.tor.TorState
 import com.samourai.sentinel.ui.dojo.DojoPairing
 import com.samourai.sentinel.ui.dojo.DojoUtility
 import com.samourai.sentinel.ui.dojo.PubKeyRescanner
+import com.samourai.sentinel.helpers.SafeJson
 import com.samourai.sentinel.ui.utils.PrefsUtil
+import com.samourai.sentinel.util.ImportTooLargeException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import okhttp3.Headers
@@ -417,6 +419,92 @@ class RescanExpiredTokenTest {
     }
 
     @Test
+    fun `an Error from login refresh is rethrown and is not swallowed`() = withPairedDojo {
+        seedExpiredToken()
+        serveAuthThen { error("the refresh must fail before it is sent") }
+        api.beforeNewCall = { _, _ -> throw OutOfMemoryError("simulated refresh failure") }
+        try {
+            runBlocking { api.refreshDojoAuth() }
+            fail("expected OutOfMemoryError")
+        } catch (e: OutOfMemoryError) {
+            assertEquals("simulated refresh failure", e.message)
+        }
+    }
+
+    @Test
+    fun `an Error from a key is rethrown and later keys are not scanned`() = withPairedDojo {
+        seedExpiredToken()
+        serveAuthThen { req ->
+            if (isXpub(req)) ok()
+            else error("unexpected ${req.path}")
+        }
+        var xpubCalls = 0
+        api.beforeNewCall = { _, request ->
+            val path = request.url.encodedPath
+            if (path == "/xpub" || path.endsWith("/xpub")) {
+                xpubCalls++
+                if (xpubCalls == 2) throw OutOfMemoryError("simulated key failure")
+            }
+        }
+        try {
+            runBlocking { PubKeyRescanner.rescanKeys(SIX_KEYS) }
+            fail("expected OutOfMemoryError")
+        } catch (e: OutOfMemoryError) {
+            assertEquals("simulated key failure", e.message)
+        }
+        assertEquals(1, xpubCount())
+    }
+
+    @Test
+    fun `the progress dialog is dismissed when an Error is thrown`() = withPairedDojo {
+        seedExpiredToken()
+        serveAuthThen { error("the call must fail before it is sent") }
+        api.beforeNewCall = { _, _ -> throw OutOfMemoryError("simulated rescan failure") }
+        val activity = rescanActivity()
+        PubKeyRescanner.rescan(activity, SIX_KEYS.take(1), emptyList(), 0, 0L)
+        waitUntil { !dialogShowing() }
+        assertFalse(dialogShowing())
+        assertTrue(
+            "the Error must reach the scope, not be swallowed",
+            logs.any { "simulated rescan failure" in it },
+        )
+    }
+
+    @Test
+    fun `a body over 64 KiB is refused by importAddress and the other capped calls`() = withPairedDojo {
+        prefs.authorization = FRESH
+        setApiKey(API_KEY)
+        val oversize = "x".repeat(SafeJson.SMALL_BODY_MAX_BYTES + 1)
+        server.dispatcher = recording {
+            MockResponse().setResponseCode(200).setBody(oversize)
+        }
+        assertOversizeRefused("importAddress") {
+            runBlocking { api.importAddress("tb1q-test-address") }.close()
+        }
+        assertOversizeRefused("importXpub") {
+            runBlocking { api.importXpub(XPUB, "bip84") }.close()
+        }
+        assertOversizeRefused("rescanPubKey") {
+            runBlocking { api.rescanPubKey(XPUB, AddressTypes.BIP84) }.close()
+        }
+        assertOversizeRefused("checkImportStatus") {
+            runBlocking { api.checkImportStatus(XPUB) }
+        }
+        assertOversizeRefused("getFees") {
+            runBlocking { api.getFees() }.close()
+        }
+        assertOversizeRefused("authenticateDojo") {
+            runBlocking { api.authenticateDojo(API_KEY) }.close()
+        }
+        assertOversizeRefused("request") {
+            runBlocking { api.request(Request.Builder().url(server.url("/rates").toString()).build()) }.close()
+        }
+        assertOversizeRefused("broadcast") {
+            runBlocking { api.broadcast("00") }
+        }
+    }
+
+    @Test
     fun `an expired-looking 401 after an off-origin redirect does not refresh or resend`() = withPairedDojo {
         seedExpiredToken()
         val offHits = CopyOnWriteArrayList<String>()
@@ -528,6 +616,16 @@ class RescanExpiredTokenTest {
     private fun authCount() = seen.count {
         it.path.substringBefore("?").endsWith("/auth/refresh") ||
             it.path.substringBefore("?").endsWith("/auth/login")
+    }
+
+    private fun assertOversizeRefused(label: String, call: () -> Unit) {
+        try {
+            call()
+            fail("a body over 64 KiB must be refused by $label")
+        } catch (e: ImportTooLargeException) {
+            assertEquals("$label must use the 64 KiB cap", SafeJson.SMALL_BODY_MAX_BYTES.toLong(), e.limit)
+            assertEquals("bytes", e.unit)
+        }
     }
 
     private fun rescanActivity(): AppCompatActivity {
