@@ -50,6 +50,9 @@ import com.samourai.sentinel.ui.utils.showFloatingSnackBar
 import com.samourai.sentinel.ui.views.KdfProgressOverlay
 import com.samourai.sentinel.ui.views.LockScreenDialog
 import com.samourai.sentinel.util.ExportImportUtil
+import com.samourai.wallet.crypto.BackupCodec
+import com.samourai.wallet.crypto.BackupCorruptException
+import com.samourai.wallet.crypto.BackupDecryptException
 import com.samourai.sentinel.util.ImportLimits
 import com.samourai.sentinel.util.ImportTooLargeException
 import com.samourai.sentinel.util.PairingImportFailure
@@ -505,6 +508,9 @@ class ImportBackUpActivity : SentinelActivity() {
                         payload = withContext(Dispatchers.IO) {
                             ExportImportUtil().decryptSentinel(payloadText, password)
                         }
+                    } catch (e: BackupCorruptException) {
+                        binding.importPasswordInputLayout.error =
+                            getString(R.string.backup_damaged_or_incomplete)
                     } catch (e: Exception) {
                         // #282: inline, on the field, with the text kept.
                         binding.importPasswordInputLayout.error =
@@ -871,6 +877,14 @@ class ImportBackUpActivity : SentinelActivity() {
                             } else if (it is CancellationException) {
                                 // Scope teardown, not a failure (#80).
                                 setImportBusy(false)
+                            } else if (it is BackupCorruptException) {
+                                setImportBusy(false)
+                                binding.importPasswordInputLayout.error =
+                                    getString(R.string.backup_damaged_or_incomplete)
+                            } else if (it is BackupDecryptException) {
+                                setImportBusy(false)
+                                binding.importPasswordInputLayout.error =
+                                    getString(R.string.backup_password_wrong)
                             } else {
                                 setImportBusy(false)
                                 showFloatingSnackBar(
@@ -1055,37 +1069,66 @@ class ImportBackUpActivity : SentinelActivity() {
      */
     private fun validatePayload(string: String) {
         viewModel.viewModelScope.launch(Dispatchers.Default + importExceptionHandler) {
-            try {
-                val json = JSONObject(string)
+            val json = try {
+                JSONObject(string)
+            } catch (_: Exception) {
+                null
+            }
+            if (json == null) {
+                val damaged = looksLikeTruncatedBackup(string)
                 withContext(Dispatchers.Main) {
+                    disarmImportPayload()
+                    showFloatingSnackBar(
+                        binding.importPastePayloadBtn,
+                        text = getString(
+                            if (damaged) R.string.backup_damaged_or_incomplete
+                            else R.string.invalid_payload
+                        ),
+                    )
+                }
+                return@launch
+            }
+            val candidateType = when {
+                json.has("external") && json.has("payload") -> ImportType.SAMOURAI
+                json.has("time") && json.has("payload") -> ImportType.SENTINEL
+                json.has("payload") -> ImportType.SENTINEL_LEGACY
+                else -> null
+            }
+            val envelopeValid = when (candidateType) {
+                ImportType.SAMOURAI -> true
+                ImportType.SENTINEL, ImportType.SENTINEL_LEGACY -> try {
+                    BackupCodec.validateEnvelope(json)
+                    true
+                } catch (_: BackupDecryptException) {
+                    false
+                }
+                null -> false
+            }
+            withContext(Dispatchers.Main) {
+                if (candidateType == null) {
+                    disarmImportPayload()
+                    showFloatingSnackBar(
+                        binding.importPastePayloadBtn,
+                        text = getString(R.string.invalid_payload),
+                    )
+                } else if (!envelopeValid) {
+                    disarmImportPayload()
+                    showFloatingSnackBar(
+                        binding.importPastePayloadBtn,
+                        text = getString(R.string.backup_damaged_or_incomplete),
+                    )
+                } else {
                     // #81 residue: drop any previously-validated payload
                     // before classifying the new one - a failed or
                     // different-type re-pick must not leave the old
                     // payload armed or the Sentinel checkbox panel
                     // visible.
-                    payloadObject = null
-                    importType = ImportType.SENTINEL
-                    binding.importSentinelBackUpLayout.visibility = View.GONE
-                    if (json.has("external") && json.has("payload")) {
-                        payloadObject = json
-                        importType = ImportType.SAMOURAI
-                        showImportButton(false)
-                    } else if (json.has("time") && json.has("payload")) {
-                        payloadObject = json
-                        importType = ImportType.SENTINEL
-                        showImportButton(false)
-                        binding.importSentinelBackUpLayout.visibility = View.VISIBLE
-                    } else if (json.has("payload")) {
-                        payloadObject = json
-                        importType = ImportType.SENTINEL_LEGACY
-                        showImportButton(false)
-                    } else {
-                        // #81 residue: showImportButton(false) SHOWS the
-                        // start button; an invalid payload must restore
-                        // the hidden baseline, not arm it.
-                        showImportButton(true)
-                        showFloatingSnackBar(binding.importStartBtn, text = "Invalid payload")
-                    }
+                    payloadObject = json
+                    importType = candidateType
+                    binding.importPasswordInputLayout.error = null
+                    binding.importSentinelBackUpLayout.visibility =
+                        if (candidateType == ImportType.SENTINEL) View.VISIBLE else View.GONE
+                    showImportButton(false)
                     // #404 (decision 7)'s calm preview line stays; the raw
                     // envelope returns BENEATH it. The pre-#405 dump
                     // carried real distinguishing value (format, kdf era,
@@ -1100,20 +1143,25 @@ class ImportBackUpActivity : SentinelActivity() {
                     // verdict. File pick, paste, and an accepted scan clear
                     // the view before validating, so an invalid re-pick
                     // leaves the card blank, never stale.
-                    if (payloadObject != null) {
-                        binding.importPayloadTextView.text =
-                            backupPreviewLine(json, backupPreviewDateFormat) +
-                                "\n\n" + backupEnvelopeDump(json)
-                    }
+                    binding.importPayloadTextView.text =
+                        backupPreviewLine(json, backupPreviewDateFormat) +
+                            "\n\n" + backupEnvelopeDump(json)
                 }
-            } catch (e: Exception) {
-                throw e
             }
         }.invokeOnCompletion {
             if (it != null && it !is CancellationException) {
                 Timber.e(it)
             }
         }
+    }
+
+    private fun looksLikeTruncatedBackup(text: String): Boolean {
+        val trimmed = text.trimStart()
+        return trimmed.startsWith("{") && (
+            trimmed.contains("\"payload\"") ||
+                trimmed.contains("\"format\"") ||
+                (trimmed.contains("\"version\"") && trimmed.contains("\"time\""))
+            )
     }
 
 
@@ -1165,6 +1213,7 @@ class ImportBackUpActivity : SentinelActivity() {
         payloadObject = null
         importType = ImportType.SENTINEL
         binding.importPayloadTextView.text = ""
+        binding.importPasswordInputLayout.error = null
         binding.importSentinelBackUpLayout.visibility = View.GONE
         showImportButton(true)
     }

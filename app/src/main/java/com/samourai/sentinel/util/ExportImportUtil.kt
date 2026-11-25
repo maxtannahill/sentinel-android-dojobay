@@ -16,6 +16,7 @@ import com.samourai.sentinel.helpers.toJSON
 import com.samourai.sentinel.ui.dojo.DojoUtility
 import com.samourai.sentinel.ui.utils.PrefsUtil
 import com.samourai.wallet.crypto.BackupCodec
+import com.samourai.wallet.crypto.BackupCorruptException
 import com.samourai.wallet.util.XPUB
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -112,15 +113,22 @@ class ExportImportUtil {
 
     fun decryptSentinel(backUp: String, password: String): Triple<ArrayList<PubKeyCollection>?, JSONObject, JSONObject?> {
         val decrypted = BackupCodec.decryptEnvelope(backUp, password)
-        val payloadJSON = JSONObject(decrypted)
-        val collectionArrayType = object : TypeToken<ArrayList<PubKeyCollection?>?>() {}.type
-        val collections = fromJSON<ArrayList<PubKeyCollection>>(payloadJSON.getJSONArray("collections").toString(), collectionArrayType)
-        val prefs = payloadJSON.getJSONObject("prefs")
-        var dojo: JSONObject? = null
-        if (payloadJSON.has("dojo")) {
-            dojo = payloadJSON.getJSONObject("dojo")
+        return try {
+            val payloadJSON = JSONObject(decrypted)
+            val collectionArrayType = object : TypeToken<ArrayList<PubKeyCollection?>?>() {}.type
+            val collections = fromJSON<ArrayList<PubKeyCollection>>(payloadJSON.getJSONArray("collections").toString(), collectionArrayType)
+                ?: throw BackupCorruptException("Backup payload is damaged or incomplete")
+            val prefs = payloadJSON.getJSONObject("prefs")
+            var dojo: JSONObject? = null
+            if (payloadJSON.has("dojo")) {
+                dojo = payloadJSON.getJSONObject("dojo")
+            }
+            Triple(collections, prefs, dojo)
+        } catch (e: BackupCorruptException) {
+            throw e
+        } catch (e: Exception) {
+            throw BackupCorruptException("Backup payload is damaged or incomplete", e)
         }
-        return Triple(collections, prefs, dojo)
     }
 
 
@@ -128,6 +136,7 @@ class ExportImportUtil {
         // Shared with decryptSentinel so a legacy v2 envelope uses the
         // same PBKDF2-HMAC-SHA256 count as export (#278).
         val decrypted = BackupCodec.decryptEnvelope(backUp, password)
+        try {
         val payloadJSON = JSONObject(decrypted)
         val publicKeys: ArrayList<PubKeyModel> = arrayListOf()
 
@@ -201,6 +210,11 @@ class ExportImportUtil {
             }
         }
         return Pair(publicKeys, dojo)
+        } catch (e: BackupCorruptException) {
+            throw e
+        } catch (e: Exception) {
+            throw BackupCorruptException("Backup payload is damaged or incomplete", e)
+        }
     }
 
 

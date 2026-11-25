@@ -21,6 +21,13 @@ object BackupCodec {
     const val FORMAT_AES_GCM = 3
 
     private const val KDF_ARGON2ID = "argon2id"
+    private const val AES_BLOCK_BYTES = 16
+    private const val LEGACY_SALTED_HEADER_LEN = 8
+    private const val LEGACY_SALT_LEN = 8
+    private const val LEGACY_HEADER_LEN = LEGACY_SALTED_HEADER_LEN + LEGACY_SALT_LEN
+    private const val LEGACY_MIN_BYTES = LEGACY_HEADER_LEN + AES_BLOCK_BYTES
+    private const val GCM_MIN_BYTES = AesGcm.NONCE_LEN + AesGcm.TAG_BITS / 8
+    private val SALTED_PREFIX = "Salted__".toByteArray(Charsets.US_ASCII)
     private val random = SecureRandom()
 
     /**
@@ -76,23 +83,84 @@ object BackupCodec {
         }
     }
 
-    fun decryptEnvelope(envelope: String, password: String): String {
-        if (password.isEmpty()) {
-            throw BackupDecryptException("Password is empty")
+    /**
+     * Validates a parsed Sentinel backup envelope's structure without requiring
+     * the password or running a KDF.
+     *
+     * Throws [BackupCorruptException] when required fields, KDF parameters,
+     * Base64 encoding, OpenSSL "Salted__" header, or cipher/GCM byte lengths
+     * are missing, malformed, or truncated.
+     */
+    fun validateEnvelope(json: JSONObject) {
+        val rawPayload = json.opt("payload") as? String
+        if (rawPayload.isNullOrEmpty()) {
+            throw BackupCorruptException("Invalid payload")
         }
+        if (json.has("format")) {
+            val format = intField(json, "format")
+                ?: throw BackupCorruptException("Invalid backup format")
+            if (format != FORMAT_AES_GCM) {
+                throw BackupCorruptException("Unsupported backup format")
+            }
+            validateCurrentEnvelope(json, rawPayload)
+            return
+        }
+        validateLegacyEnvelope(json, rawPayload)
+    }
+
+    private fun validateCurrentEnvelope(json: JSONObject, rawPayload: String) {
+        if (json.opt("kdf") as? String != KDF_ARGON2ID) {
+            throw BackupCorruptException("Unsupported backup KDF")
+        }
+        val memoryKiB = intField(json, "memoryKiB") ?: -1
+        val iterations = intField(json, "iterations") ?: -1
+        val parallelism = intField(json, "parallelism") ?: -1
+        if (memoryKiB < 8 * 1024 || memoryKiB > 256 * 1024 ||
+            iterations < 1 || iterations > 8 ||
+            parallelism != 1
+        ) {
+            throw BackupCorruptException("Unsupported backup KDF profile")
+        }
+        val rawSalt = json.opt("salt") as? String
+            ?: throw BackupCorruptException("Unsupported backup salt")
+        val salt = decodeStrictBase64(rawSalt)
+        if (salt.size < 16 || salt.size > 64) {
+            throw BackupCorruptException("Unsupported backup salt")
+        }
+        val blob = decodeStrictBase64(rawPayload)
+        if (blob.size < GCM_MIN_BYTES) {
+            throw BackupCorruptException("Truncated backup payload")
+        }
+    }
+
+    private fun validateLegacyEnvelope(json: JSONObject, rawPayload: String) {
+        val version = legacyVersionField(json)
+            ?: throw BackupCorruptException("Invalid backup version")
+        val bytes = decodeStrictBase64(rawPayload)
+        if (bytes.size < LEGACY_MIN_BYTES || bytes.size % AES_BLOCK_BYTES != 0) {
+            throw BackupCorruptException("Truncated or misaligned backup payload")
+        }
+        if (version != 1) {
+            for (i in SALTED_PREFIX.indices) {
+                if (bytes[i] != SALTED_PREFIX[i]) {
+                    throw BackupCorruptException("Invalid backup header")
+                }
+            }
+        }
+    }
+
+    fun decryptEnvelope(envelope: String, password: String): String {
         val json = try {
             JSONObject(envelope)
         } catch (e: Exception) {
-            throw BackupDecryptException("Invalid payload", e)
+            throw BackupCorruptException("Invalid payload", e)
         }
-        if (!json.has("payload")) {
-            throw BackupDecryptException("Invalid payload")
+        validateEnvelope(json)
+        if (password.isEmpty()) {
+            throw BackupDecryptException("Password is empty")
         }
         if (json.optInt("format", 0) == FORMAT_AES_GCM) {
             return decryptCurrent(json, password)
-        }
-        if (!json.has("version")) {
-            throw BackupDecryptException("Invalid payload")
         }
         return decryptLegacy(json.getString("payload"), json.getInt("version"), password)
     }
@@ -110,8 +178,8 @@ object BackupCodec {
         ) {
             throw BackupDecryptException("Unsupported backup KDF profile")
         }
-        val salt = decode(json.optString("salt"))
-        val blob = decode(json.optString("payload"))
+        val salt = decodeStrictBase64(json.optString("salt"))
+        val blob = decodeStrictBase64(json.optString("payload"))
         if (salt.size < 16 || salt.size > 64) {
             throw BackupDecryptException("Unsupported backup salt")
         }
@@ -137,8 +205,8 @@ object BackupCodec {
 
     private fun decryptLegacy(payload: String, version: Int, password: String): String {
         val passwordChars = CharSequenceX(password)
-        try {
-            return if (version == 1) {
+        val plain = try {
+            if (version == 1) {
                 AESUtil.decrypt(payload, passwordChars, AESUtil.DefaultPBKDF2Iterations)
             } else {
                 AESUtil.decryptSHA256(
@@ -150,18 +218,81 @@ object BackupCodec {
         } catch (e: Exception) {
             throw BackupDecryptException("Unable to decrypt", e)
         }
+        if (plain.indexOf('\uFFFD') >= 0) {
+            throw BackupDecryptException("Unable to decrypt")
+        }
+        return plain
     }
 
-    private fun decode(value: String): ByteArray {
-        if (value.isEmpty()) {
-            throw BackupDecryptException("Invalid payload")
+    private fun intField(json: JSONObject, key: String): Int? {
+        if (!json.has(key) || json.isNull(key)) return null
+        val value = json.opt(key)
+        return when (value) {
+            is Int -> value
+            is Long -> if (value in Int.MIN_VALUE..Int.MAX_VALUE) value.toInt() else null
+            else -> null
+        }
+    }
+
+    private fun legacyVersionField(json: JSONObject): Int? {
+        if (!json.has("version") || json.isNull("version")) return null
+        val value = json.opt("version")
+        return when (value) {
+            is Int -> value
+            is Long -> if (value in Int.MIN_VALUE..Int.MAX_VALUE) value.toInt() else null
+            is String -> value.toIntOrNull()
+            else -> null
+        }
+    }
+
+    private fun decodeStrictBase64(value: String): ByteArray {
+        val cleaned = buildString(value.length) {
+            for (ch in value) {
+                if (ch != '\r' && ch != '\n') append(ch)
+            }
+        }.trim()
+        if (cleaned.isEmpty() || cleaned.length % 4 != 0) {
+            throw BackupCorruptException("Invalid payload encoding")
+        }
+        val len = cleaned.length
+        for (i in 0 until len) {
+            val ch = cleaned[i]
+            val isBase64Char = (ch in 'A'..'Z') || (ch in 'a'..'z') || (ch in '0'..'9') || ch == '+' || ch == '/'
+            if (isBase64Char) continue
+            if (ch == '=') {
+                if (i < len - 2) throw BackupCorruptException("Invalid payload padding")
+                if (i == len - 2 && cleaned[len - 1] != '=') throw BackupCorruptException("Invalid payload padding")
+                continue
+            }
+            throw BackupCorruptException("Invalid payload character")
+        }
+        if (cleaned[len - 1] == '=') {
+            if (cleaned[len - 2] == '=') {
+                val idx = base64AlphabetIndex(cleaned[len - 3])
+                if ((idx and 0x0F) != 0) throw BackupCorruptException("Invalid payload padding")
+            } else {
+                val idx = base64AlphabetIndex(cleaned[len - 2])
+                if ((idx and 0x03) != 0) throw BackupCorruptException("Invalid payload padding")
+            }
         }
         return try {
-            Base64.decode(value)
+            Base64.decode(cleaned)
         } catch (e: Exception) {
-            throw BackupDecryptException("Invalid payload", e)
+            throw BackupCorruptException("Invalid payload encoding", e)
         }
+    }
+
+    private fun base64AlphabetIndex(ch: Char): Int = when (ch) {
+        in 'A'..'Z' -> ch - 'A'
+        in 'a'..'z' -> ch - 'a' + 26
+        in '0'..'9' -> ch - '0' + 52
+        '+' -> 62
+        '/' -> 63
+        else -> -1
     }
 }
 
-class BackupDecryptException(message: String, cause: Throwable? = null) : Exception(message, cause)
+open class BackupDecryptException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+class BackupCorruptException(message: String, cause: Throwable? = null) :
+    BackupDecryptException(message, cause)

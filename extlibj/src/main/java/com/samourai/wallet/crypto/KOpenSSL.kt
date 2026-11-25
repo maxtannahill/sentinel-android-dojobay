@@ -140,12 +140,24 @@ class KOpenSSL {
             components.clearValues()
         }
 
+        if (decrypted.isEmpty()) {
+            throw BadPaddingException("Empty decrypted block")
+        }
+        val padLen = decrypted.last().toInt() and 0xFF
+        if (padLen < 1 || padLen > 16 || padLen > decrypted.size) {
+            throw BadPaddingException("Invalid PKCS5 padding length")
+        }
+        for (i in decrypted.size - padLen until decrypted.size) {
+            if ((decrypted[i].toInt() and 0xFF) != padLen) {
+                throw BadPaddingException("Invalid PKCS5 padding byte")
+            }
+        }
+
         if (!isValidUTF8(decrypted)) {
             throw CharacterCodingException()
         }
 
-        // Last byte of the decrypted text is the number of padding bytes needed to remove
-        val plaintext = decrypted.copyOfRange(0, decrypted.size - decrypted.last().toInt())
+        val plaintext = decrypted.copyOfRange(0, decrypted.size - padLen)
 
         return plaintext.toString(Charsets.UTF_8).trim()
     }

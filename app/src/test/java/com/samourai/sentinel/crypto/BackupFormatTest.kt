@@ -5,6 +5,7 @@ import com.samourai.wallet.crypto.AESUtil
 import com.samourai.wallet.crypto.AesGcm
 import com.samourai.wallet.crypto.AuthTagException
 import com.samourai.wallet.crypto.BackupCodec
+import com.samourai.wallet.crypto.BackupCorruptException
 import com.samourai.wallet.crypto.BackupDecryptException
 import com.samourai.wallet.util.CharSequenceX
 import org.bouncycastle.util.encoders.Base64
@@ -126,6 +127,152 @@ class BackupFormatTest {
         assertEquals(XPUB, parsed.first[0].pubKey)
         assertEquals("Savings", parsed.first[0].label)
         assertEquals(null, parsed.second)
+    }
+
+    @Test
+    fun truncatedAndCorruptLegacyV2EnvelopesFailValidation() {
+        val env = legacyEnvelope(SENTINEL_PLAIN, 2, AESUtil.DefaultPBKDF2HMACSHA256Iterations, sha256 = true)
+        BackupCodec.validateEnvelope(JSONObject(env))
+
+        // SET-06 style: outer JSON closed, payload cut in half
+        val half = env.substring(0, env.length / 2) + "\"}"
+        try {
+            BackupCodec.validateEnvelope(JSONObject(half))
+            fail("truncated legacy v2 envelope accepted")
+        } catch (_: BackupCorruptException) {
+        }
+
+        // Multiple-of-4 base64 length that is not 16-byte AES block aligned
+        val json = JSONObject(env)
+        val payload = json.getString("payload").replace("\n", "")
+        val misalignedLen = ((payload.length / 2) / 4) * 4
+        json.put("payload", payload.substring(0, misalignedLen))
+        val rawBytes = Base64.decode(json.getString("payload"))
+        assertTrue(rawBytes.size % 16 != 0 || rawBytes.size < 32)
+        try {
+            BackupCodec.validateEnvelope(json)
+            fail("misaligned legacy v2 envelope accepted")
+        } catch (_: BackupCorruptException) {
+        }
+
+        // Valid base64 & multiple of 16 bytes, but missing OpenSSL Salted__ header
+        val badHeader = ByteArray(32).also { random.nextBytes(it) }
+        badHeader[0] = 0
+        try {
+            BackupCodec.validateEnvelope(
+                JSONObject(env).put("payload", Base64.toBase64String(badHeader))
+            )
+            fail("un-salted legacy v2 envelope accepted")
+        } catch (_: BackupCorruptException) {
+        }
+    }
+
+    @Test
+    fun truncatedAndCorruptFormat3EnvelopesFailValidation() {
+        val env = BackupCodec.encrypt(SENTINEL_PLAIN, PASSWORD, 55, 1L)
+        BackupCodec.validateEnvelope(JSONObject(env))
+
+        val truncatedPayload = JSONObject(env).apply {
+            val raw = getString("payload")
+            put("payload", raw.substring(0, (raw.length / 2) - 1))
+        }
+        try {
+            BackupCodec.validateEnvelope(truncatedPayload)
+            fail("truncated format 3 envelope accepted")
+        } catch (_: BackupCorruptException) {
+        }
+
+        // Too short for nonce + 16-byte GCM tag (28 bytes)
+        val tooShort = JSONObject(env).put("payload", Base64.toBase64String(ByteArray(20)))
+        try {
+            BackupCodec.validateEnvelope(tooShort)
+            fail("too-short GCM payload accepted")
+        } catch (_: BackupCorruptException) {
+        }
+
+        // Corrupted base64 character
+        val badChar = JSONObject(env).apply {
+            val raw = getString("payload")
+            put("payload", "!" + raw.substring(1))
+        }
+        try {
+            BackupCodec.validateEnvelope(badChar)
+            fail("corrupt base64 payload accepted")
+        } catch (_: BackupCorruptException) {
+        }
+
+        // Unknown format number
+        val badFormat = JSONObject(env).put("format", 99)
+        try {
+            BackupCodec.validateEnvelope(badFormat)
+            fail("unsupported format accepted")
+        } catch (_: BackupCorruptException) {
+        }
+    }
+
+    @Test
+    fun truncatedLegacyV1EnvelopeFailsValidation() {
+        val env = legacyEnvelope(SENTINEL_PLAIN, 1, AESUtil.DefaultPBKDF2Iterations, sha256 = false)
+        BackupCodec.validateEnvelope(JSONObject(env))
+
+        val shortV1 = JSONObject(env).put("payload", Base64.toBase64String(ByteArray(16)))
+        try {
+            BackupCodec.validateEnvelope(shortV1)
+            fail("single-block v1 envelope without ciphertext accepted")
+        } catch (_: BackupCorruptException) {
+        }
+    }
+
+    @Test
+    fun decryptedTruncatedInnerJsonReportsBackupCorruptNotWrongPassword() {
+        val truncatedInner = """{"collections":[{"id":"1""""
+        val gcmEnv = BackupCodec.encrypt(truncatedInner, PASSWORD, 55, 1L)
+        BackupCodec.validateEnvelope(JSONObject(gcmEnv))
+        try {
+            ExportImportUtil().decryptSentinel(gcmEnv, PASSWORD)
+            fail("truncated inner JSON imported")
+        } catch (_: BackupCorruptException) {
+        }
+
+        val cbcEnv = legacyEnvelope(
+            truncatedInner,
+            2,
+            AESUtil.DefaultPBKDF2HMACSHA256Iterations,
+            sha256 = true,
+        )
+        BackupCodec.validateEnvelope(JSONObject(cbcEnv))
+        try {
+            ExportImportUtil().decryptSentinel(cbcEnv, PASSWORD)
+            fail("truncated legacy inner JSON imported")
+        } catch (_: BackupCorruptException) {
+        }
+    }
+
+    @Test
+    fun wrongPasswordAndCiphertextTamperStillThrowNonCorruptBackupDecryptException() {
+        val cbcEnv = legacyEnvelope(
+            SENTINEL_PLAIN,
+            2,
+            AESUtil.DefaultPBKDF2HMACSHA256Iterations,
+            sha256 = true,
+        )
+        try {
+            ExportImportUtil().decryptSentinel(cbcEnv, "wrong-password")
+            fail("wrong password opened legacy v2")
+        } catch (e: BackupDecryptException) {
+            assertFalse(e is BackupCorruptException)
+        }
+
+        val tampered = JSONObject(cbcEnv)
+        val raw = Base64.decode(tampered.getString("payload").replace("\n", ""))
+        raw[raw.size - 1] = (raw[raw.size - 1].toInt() xor 0xFF).toByte()
+        tampered.put("payload", Base64.toBase64String(raw))
+        try {
+            ExportImportUtil().decryptSentinel(tampered.toString(), PASSWORD)
+            fail("tampered legacy v2 opened")
+        } catch (e: BackupDecryptException) {
+            assertFalse(e is BackupCorruptException)
+        }
     }
 
     private fun legacyEnvelope(plain: String, version: Int, iterations: Int, sha256: Boolean): String {

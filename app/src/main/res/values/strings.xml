@@ -585,6 +585,7 @@
     <string name="pairing_password_too_many" translatable="false">A pairing password has three words</string>
     <string name="pairing_password_wrong" translatable="false">Wrong password. Check the three words and try again</string>
     <string name="backup_password_wrong" translatable="false">Incorrect password, please try again</string>
+    <string name="backup_damaged_or_incomplete" translatable="false">This backup is damaged or incomplete</string>
     <!-- #399: each pairing-import failure has its own sentence. -->
     <string name="pairing_import_wrong_password">Incorrect password, please try again.</string>
     <string name="pairing_import_unrecognised">This pairing payload isn\'t in a format Sentinel recognises.</string>
