@@ -32,6 +32,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -298,6 +299,86 @@ class DojoVersionHeaderTest {
             server.enqueue(r)
             client.newCall(pairingLoginRequest(localPairing)).execute().use { assertNull(readPairingLogin(it)) }
         }
+    }
+
+    //
+    // Calls inside commitPairedDojo and clearDojo. A reply from the old
+    // Dojo that lands between two of their steps must not survive.
+    //
+
+    /**
+     * Runs [action] once, the first time the pref [name] is about to be
+     * written (the listener fires before the write), while [block] is
+     * in progress on this thread.
+     */
+    private fun onFirstWrite(name: String, action: () -> Unit, block: () -> Unit) {
+        var fired = false
+        val hook = object : Preferences.SharedPrefsListener {
+            override fun onSharedPrefChanged(property: KProperty<*>) {
+                if (fired || property.name != name) return
+                fired = true
+                action()
+            }
+        }
+        prefs.addListener(hook)
+        try {
+            block()
+        } finally {
+            prefs.removeListener(hook)
+        }
+        assertTrue("$name was never written", fired)
+    }
+
+    private fun oldDojoReplies(version: String) {
+        server.enqueue(answer(version = version))
+        runBlocking { api.getFees().close() }
+    }
+
+    @Test
+    fun `commitPairedDojo saves the login's version after the endpoint switch`() {
+        // The old Dojo answers just before its endpoint is replaced. Its
+        // answer is still current at that point, so it is saved, and the
+        // login's version must be written after it.
+        onFirstWrite("apiEndPointTor", { oldDojoReplies("1.0.0") }) {
+            dojo.commitPairedDojo(newPayload, newUrl, "1.29.3")
+        }
+        assertEquals("1.29.3", prefs.dojoReportedVersion)
+        assertEquals(newUrl, prefs.apiEndPoint)
+        assertEquals(newUrl, prefs.apiEndPointTor)
+    }
+
+    @Test
+    fun `commitPairedDojo writes the login's version last, after both endpoints`() {
+        val writesInOrder = mutableListOf<String>()
+        val record = object : Preferences.SharedPrefsListener {
+            override fun onSharedPrefChanged(property: KProperty<*>) {
+                writesInOrder += property.name
+            }
+        }
+        prefs.addListener(record)
+        try {
+            dojo.commitPairedDojo(newPayload, newUrl, "1.29.3")
+        } finally {
+            prefs.removeListener(record)
+        }
+        val version = writesInOrder.lastIndexOf(DojoReportedVersion.KEY)
+        assertTrue("version not written", version >= 0)
+        assertTrue(writesInOrder.indexOf("apiEndPointTor") in 0 until version)
+        assertTrue(writesInOrder.indexOf("apiEndPoint") in 0 until version)
+        assertEquals("1.29.3", prefs.dojoReportedVersion)
+    }
+
+    @Test
+    fun `a reply that lands while clearDojo nulls the URLs does not survive the unpair`() {
+        prefs.refreshToken = "synthetic-refresh"
+        DojoReportedVersion.setFromPairingLogin(prefs, "1.0.0")
+        // The version was already cleared when this reply is saved, but
+        // the Dojo URL is still set, so the answer looks current.
+        onFirstWrite("apiEndPoint", { oldDojoReplies("1.29.9") }) {
+            dojo.clearDojo()
+        }
+        assertNull(prefs.apiEndPoint)
+        assertNull(prefs.dojoReportedVersion)
     }
 
     //

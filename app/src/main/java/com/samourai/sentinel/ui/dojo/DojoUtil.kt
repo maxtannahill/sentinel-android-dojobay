@@ -102,6 +102,11 @@ class DojoUtility {
         prefsUtil.refreshToken = ""
         prefsUtil.apiEndPointTor = null
         prefsUtil.apiEndPoint = null
+        // notePairingChanged() cleared the reported version first, but until
+        // the URLs above were nulled a Dojo call sent after that clear still
+        // looked current, and its answer could write a version back. With no
+        // URL set no call counts as a Dojo call, so clear once more here.
+        DojoReportedVersion.clear(prefsUtil)
         prefsUtil.dojoDisplayName = null
         prefsUtil.dojoDisplayFlag = null
         prefsUtil.dojoDisplayUrl = null
