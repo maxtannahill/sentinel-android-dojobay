@@ -70,6 +70,7 @@ import timber.log.Timber
 import java.math.BigDecimal
 import java.math.BigInteger
 import java.text.DecimalFormat
+import java.text.NumberFormat
 import java.util.*
 
 class SendFragment : Fragment() {
@@ -889,19 +890,25 @@ class SendFragment : Fragment() {
             clearEnteredAmount(clearBtcField = true, clearFiatField = true)
             return
         }
-        val grouping = (DecimalFormat.getInstance() as DecimalFormat)
-            .decimalFormatSymbols.groupingSeparator.toString()
-        val ungroupedFiat = fiatString.replace(grouping, "")
+        // The field is shown in the user's locale (1.234,56 in de-DE), so
+        // read it with that locale's separators. #622 review
+        val fiatFormat = NumberFormat.getNumberInstance()
+        val symbols = (fiatFormat as DecimalFormat).decimalFormatSymbols
         try {
-            if (ungroupedFiat.isEmpty()) {
+            val plainFiat = SatsAmount.normalizeFiat(fiatString, symbols)
+            if (plainFiat == null) {
+                clearEnteredAmount(clearBtcField = true, clearFiatField = false)
+                return
+            }
+            if (plainFiat.isEmpty()) {
                 clearEnteredAmount(clearBtcField = true, clearFiatField = true)
                 return
             }
-            val parts = ungroupedFiat.split(".")
+            val parts = plainFiat.split(".")
             val effectiveFiat = if (parts.size == 2 && parts[1].length > 2) {
-                (parts[0] + "." + parts[1].take(2)).also { setFiatEdit(it) }
+                parts[0] + "." + parts[1].take(2)
             } else {
-                ungroupedFiat
+                plainFiat
             }
             val fiat = SatsAmount.parseFiat(effectiveFiat)
             if (fiat == null) {
@@ -914,10 +921,7 @@ class SendFragment : Fragment() {
                 return
             }
 
-            if (effectiveFiat.endsWith('.'))
-                setFiatEdit(DecimalFormat.getNumberInstance().format(fiat) + ".")
-            else
-                setFiatEdit(DecimalFormat.getNumberInstance().format(fiat))
+            setFiatEdit(SatsAmount.formatFiatInput(effectiveFiat, fiatFormat))
 
             // #612: the sats this fiat figure converts to are the amount,
             // computed via BigDecimal without Float rounding loss.
