@@ -8,8 +8,16 @@ import androidx.preference.PreferenceFragmentCompat
 import com.samourai.sentinel.R
 import com.samourai.sentinel.ui.broadcast.BroadcastTx
 import com.samourai.sentinel.ui.tools.sweep.SweepPrivKeyFragment
+import com.samourai.sentinel.ui.utils.SingleFlightAction
 
 class ToolsFragment : PreferenceFragmentCompat() {
+    private val broadcastLaunch = SingleFlightAction()
+
+    override fun onResume() {
+        super.onResume()
+        broadcastLaunch.reset()
+    }
+
     override fun onCreatePreferences(savedInstanceState: Bundle?, rootKey: String?) {
         setPreferencesFromResource(R.xml.tools_preferences, rootKey)
     }
@@ -20,15 +28,25 @@ class ToolsFragment : PreferenceFragmentCompat() {
 
         findPreference<Preference>("sweep")
             ?.setOnPreferenceClickListener {
-                val bottomSheetFragment = SweepPrivKeyFragment()
-                bottomSheetFragment.show(parentFragmentManager, bottomSheetFragment.tag)
+                // Commit synchronously so another queued tap sees the same sheet.
+                if (!parentFragmentManager.isStateSaved &&
+                    parentFragmentManager.findFragmentByTag(TAG_SWEEP) == null
+                ) {
+                    SweepPrivKeyFragment().showNow(parentFragmentManager, TAG_SWEEP)
+                }
                 true
             }
         findPreference<Preference>("broadcastTx")
             ?.setOnPreferenceClickListener {
-                startActivity(Intent(requireActivity(), BroadcastTx::class.java))
+                broadcastLaunch.run {
+                    startActivity(Intent(requireActivity(), BroadcastTx::class.java))
+                }
                 true
             }
+    }
+
+    companion object {
+        private const val TAG_SWEEP = "tools_sweep"
     }
 
     private fun setTransparencyToIcons() {
